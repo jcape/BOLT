@@ -1600,8 +1600,16 @@ bool BinaryFunction::postProcessIndirectBranches() {
             IsR2Set = true;
         }
 
-        if (!IsR1Set || !IsR2Set)
+        if (!IsR1Set || !IsR2Set) {
+          if (opts::Verbosity >= 2) {
+            outs() << "BOLT-INFO: rejected potential PIC jump table in function "
+                   << *this << " because the jump-on registers were not defined"
+                   << " in basic block " << BB->getName() << ".\n";
+            DEBUG(dbgs() << BC.printInstructions(dbgs(), BB->begin(), BB->end(),
+                                                 BB->getOffset(), this, true));
+          }
           return false;
+        }
 
         continue;
       }
