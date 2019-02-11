@@ -35,6 +35,7 @@ add_llvm_library(LLVMBOLTPasses
   ValidateInternalCalls.cpp
   VeneerElimination.cpp
   RetpolineInsertion.cpp
+  LFenceInsertion.cpp
 
   DEPENDS
   intrinsics_gen

@@ -24,6 +24,7 @@
 #include "Passes/ReorderData.h"
 #include "Passes/StokeInfo.h"
 #include "Passes/RetpolineInsertion.h"
+#include "Passes/LFenceInsertion.h"
 #include "Passes/ValidateInternalCalls.h"
 #include "Passes/VeneerElimination.h"
 #include "llvm/Support/Timer.h"
@@ -461,6 +462,9 @@ void BinaryFunctionPassManager::runAllPasses(
 
   Manager.registerPass(
       llvm::make_unique<RetpolineInsertion>(PrintRetpolineInsertion));
+
+  Manager.registerPass(
+      llvm::make_unique<LFenceInsertion>());
 
   // Thighten branches according to offset differences between branch and
   // targets. No extra instructions after this pass, otherwise we may have
