@@ -624,6 +624,10 @@ public:
     return Inst.getOpcode() == X86::MOVSX64rm32;
   }
 
+  bool isMOV64rr(const MCInst &Inst) const override {
+    return Inst.getOpcode() == X86::MOV64rr;
+  }
+
   bool isLeave(const MCInst &Inst) const override {
     return Inst.getOpcode() == X86::LEAVE ||
            Inst.getOpcode() == X86::LEAVE64;
@@ -2271,7 +2275,8 @@ public:
     // Analyze PIC-style jump table code template:
     //
     //    lea PIC_JUMP_TABLE(%rip), {%r1|%r2}     <- MemLocInstr
-    //    mov ({%r1|%r2}, %index, 4), {%r2|%r1}
+    //    mov {%r1|%r2}, {%r2|%r1}
+    //    mov ({%r1|%r2}, %index, 4), {%r1|%r2}
     //    add %r2, %r1
     //    jmp *%r1
     //
@@ -2311,6 +2316,12 @@ public:
           !InstrDesc.hasDefOfPhysReg(Instr, R2, *RegInfo)) {
         // Ignore instructions that don't affect R1, R2 registers.
         continue;
+      } else if (isMOV64rr(Instr)) {
+        if (InstrDesc.hasDefOfPhysReg(Instr, R1, *RegInfo)) {
+          R1 = Instr.getOperand(1).getReg();
+        } else if (InstrDesc.hasDefOfPhysReg(Instr, R2, *RegInfo)) {
+          R2 = Instr.getOperand(1).getReg();
+        }
       } else if (!MovInstr) {
         // Expect to see MOV instruction.
         if (!isMOVSX64rm32(Instr)) {
@@ -2339,22 +2350,24 @@ public:
                                       &ScaleValue, &IndexRegNum,
                                       &DispValue, &SegRegNum))
           break;
-        if (BaseRegNum != R1 ||
-            ScaleValue != 4 ||
+        if (ScaleValue != 4 ||
             IndexRegNum == X86::NoRegister ||
             DispValue != 0 ||
             SegRegNum != X86::NoRegister)
           break;
+        R2 = BaseRegNum;
         MovInstr = &Instr;
       } else {
-        if (!InstrDesc.hasDefOfPhysReg(Instr, R1, *RegInfo))
-          continue;
         if (!isLEA64r(Instr)) {
           DEBUG(dbgs() << "LEA instruction expected\n");
           break;
         }
         if (Instr.getOperand(0).getReg() != R1) {
           DEBUG(dbgs() << "LEA instruction expected to set %r1\n");
+          break;
+        }
+        if (R2 != R1) {
+          DEBUG(dbgs() << "%r2 did not converge with %r1\n");
           break;
         }
 
