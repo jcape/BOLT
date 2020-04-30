@@ -483,8 +483,9 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
   Manager.registerPass(
       llvm::make_unique<RetpolineInsertion>(PrintRetpolineInsertion));
 
-  Manager.registerPass(
-      llvm::make_unique<LFenceInsertion>());
+  // Insert lfences to mitigate Spectre v1 and LVI. This pass is not compatible
+  // with the retpoline mitigation pass.
+  Manager.registerPass(llvm::make_unique<LFenceInsertion>());
 
   // Assign each function an output section.
   Manager.registerPass(llvm::make_unique<AssignSections>());

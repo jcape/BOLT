@@ -2203,7 +2203,7 @@ bool RewriteInstance::analyzeRelocation(const RelocationRef &Rel,
            truncateToSize(SymbolAddress + Addend - PCRelOffset, RelSize);
   };
 
-  assert(verifyExtractedValue() && "mismatched extracted relocation value");
+  //assert(verifyExtractedValue() && "mismatched extracted relocation value");
 
   return true;
 }

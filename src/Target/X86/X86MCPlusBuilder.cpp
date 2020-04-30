@@ -628,6 +628,10 @@ public:
     return Inst.getOpcode() == X86::MOV64rr;
   }
 
+  bool isLfence(const MCInst &Inst) const override {
+    return Inst.getOpcode() == X86::LFENCE;
+  }
+
   bool isLeave(const MCInst &Inst) const override {
     return Inst.getOpcode() == X86::LEAVE ||
            Inst.getOpcode() == X86::LEAVE64;
@@ -2754,6 +2758,57 @@ public:
     return true;
   }
 
+  bool createNot(MCInst &Inst, const MCPhysReg &BaseReg, int64_t Scale,
+                 const MCPhysReg &IndexReg, int64_t Offset,
+                 const MCExpr *OffsetExpr, const MCPhysReg &AddrSegmentReg,
+                 int Size) const override {
+    unsigned NewOpcode;
+    switch (Size) {
+      default:
+        return false;
+      case 2:      NewOpcode = X86::NOT16m; break;
+      case 4:      NewOpcode = X86::NOT32m; break;
+      case 8:      NewOpcode = X86::NOT64m; break;
+    }
+    Inst.setOpcode(NewOpcode);
+    Inst.clear();
+    Inst.addOperand(MCOperand::createReg(BaseReg));
+    Inst.addOperand(MCOperand::createImm(Scale));
+    Inst.addOperand(MCOperand::createReg(IndexReg));
+    if (OffsetExpr)
+      Inst.addOperand(MCOperand::createExpr(OffsetExpr)); // Displacement
+    else
+      Inst.addOperand(MCOperand::createImm(Offset)); // Displacement
+    Inst.addOperand(MCOperand::createReg(AddrSegmentReg));
+    return true;
+  }
+
+  bool createLea(MCInst &Inst, const MCPhysReg &BaseReg, int64_t Scale,
+                 const MCPhysReg &IndexReg, int64_t Offset,
+                 const MCExpr *OffsetExpr, const MCPhysReg &AddrSegmentReg,
+                 const MCPhysReg &DstReg, int Size) const override {
+    unsigned NewOpcode;
+    switch (Size) {
+      default:
+        return false;
+      case 2:      NewOpcode = X86::LEA16r; break;
+      case 4:      NewOpcode = X86::LEA32r; break;
+      case 8:      NewOpcode = X86::LEA64r; break;
+    }
+    Inst.clear();
+    Inst.setOpcode(NewOpcode);
+    Inst.addOperand(MCOperand::createReg(DstReg));
+    Inst.addOperand(MCOperand::createReg(BaseReg));
+    Inst.addOperand(MCOperand::createImm(Scale));
+    Inst.addOperand(MCOperand::createReg(IndexReg));
+    if (OffsetExpr)
+      Inst.addOperand(MCOperand::createExpr(OffsetExpr)); // Displacement
+    else
+      Inst.addOperand(MCOperand::createImm(Offset)); // Displacement
+    Inst.addOperand(MCOperand::createReg(AddrSegmentReg));
+    return true;
+  }
+
   bool createIncMemory(MCInst &Inst, const MCSymbol *Target,
                        MCContext *Ctx) const override {
 
@@ -3011,6 +3066,10 @@ public:
     return X86::R11;
   }
 
+  MCPhysReg getInstructionPointer() const override {
+    return X86::RIP;
+  }
+
   MCPhysReg getNoRegister() const override {
     return X86::NoRegister;
   }
@@ -3099,6 +3158,32 @@ public:
     }
     Inst.setOpcode(NewOpcode);
     Inst.addOperand(MCOperand::createReg(Reg));
+  }
+
+  void createPushRegisterIndirect(MCInst &Inst,
+                                  const MCPhysReg &BaseReg, int64_t Scale,
+                                  const MCPhysReg &IndexReg, int64_t Offset,
+                                  const MCExpr *OffsetExpr,
+                                  const MCPhysReg &AddrSegmentReg,
+                                  unsigned Size) const {
+    Inst.clear();
+    unsigned NewOpcode = 0;
+    switch (Size) {
+    case 2: NewOpcode = X86::PUSH16rmm;  break;
+    case 4: NewOpcode = X86::PUSH32rmm;  break;
+    case 8: NewOpcode = X86::PUSH64rmm;  break;
+    default:
+      assert(false);
+    }
+    Inst.setOpcode(NewOpcode);
+    Inst.addOperand(MCOperand::createReg(BaseReg));
+    Inst.addOperand(MCOperand::createImm(Scale));
+    Inst.addOperand(MCOperand::createReg(IndexReg));
+    if (OffsetExpr)
+      Inst.addOperand(MCOperand::createExpr(OffsetExpr)); // Displacement
+    else
+      Inst.addOperand(MCOperand::createImm(Offset)); // Displacement
+    Inst.addOperand(MCOperand::createReg(AddrSegmentReg));
   }
 
   void createPopRegister(MCInst &Inst, MCPhysReg Reg,

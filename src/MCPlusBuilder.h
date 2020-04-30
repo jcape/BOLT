@@ -403,6 +403,15 @@ public:
     llvm_unreachable("not implemented");
   }
 
+  virtual void createPushRegisterIndirect(MCInst &Inst,
+                                          const MCPhysReg &BaseReg, int64_t Scale,
+                                          const MCPhysReg &IndexReg, int64_t Offset,
+                                          const MCExpr *OffsetExpr,
+                                          const MCPhysReg &AddrSegmentReg,
+                                          unsigned Size) const {
+    llvm_unreachable("not implemented");
+  }
+
   virtual void createPopRegister(MCInst &Inst, MCPhysReg Reg,
                                  unsigned Size) const {
     llvm_unreachable("not implemented");
@@ -423,6 +432,10 @@ public:
   }
 
   virtual MCPhysReg getX86R11() const {
+    llvm_unreachable("not implemented");
+  }
+
+  virtual MCPhysReg getInstructionPointer() const {
     llvm_unreachable("not implemented");
   }
 
@@ -527,6 +540,11 @@ public:
   }
 
   virtual bool isMOV64rr(const MCInst &Inst) const {
+    llvm_unreachable("not implemented");
+    return false;
+  }
+
+  virtual bool isLfence(const MCInst &Inst) const {
     llvm_unreachable("not implemented");
     return false;
   }
@@ -1411,6 +1429,24 @@ public:
                           const MCExpr *OffsetExpr,
                           const MCPhysReg &AddrSegmentReg,
                           const MCPhysReg &DstReg, int Size) const {
+    llvm_unreachable("not implemented");
+    return false;
+  }
+
+  /// Create instruction to bitwise invert contents of target
+  virtual bool createNot(MCInst &Inst, const MCPhysReg &BaseReg, int64_t Scale,
+                         const MCPhysReg &IndexReg, int64_t Offset,
+                         const MCExpr *OffsetExpr,
+                         const MCPhysReg &AddrSegmentReg, int Size) const {
+    llvm_unreachable("not implemented");
+    return false;
+  }
+
+  /// Create instruction to load an effective address into a target
+  virtual bool createLea(MCInst &Inst, const MCPhysReg &BaseReg, int64_t Scale,
+                         const MCPhysReg &IndexReg, int64_t Offset,
+                         const MCExpr *OffsetExpr, const MCPhysReg &AddrSegmentReg,
+                         const MCPhysReg &DstReg, int Size) const {
     llvm_unreachable("not implemented");
     return false;
   }
