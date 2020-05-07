@@ -455,8 +455,11 @@ bool Inliner::inlineCallsInFunction(BinaryFunction &Function) {
 
       const auto *TargetSymbol = BC.MIB->getTargetSymbol(Inst);
       assert(TargetSymbol && "target symbol expected for direct call");
-      auto *TargetFunction = BC.getFunctionForSymbol(TargetSymbol);
-      if (!TargetFunction) {
+
+      // Don't inline calls to a secondary entry point in a target function.
+      uint64_t EntryID{0};
+      auto *TargetFunction = BC.getFunctionForSymbol(TargetSymbol, &EntryID);
+      if (!TargetFunction || EntryID != 0) {
         ++InstIt;
         continue;
       }

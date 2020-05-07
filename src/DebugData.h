@@ -94,13 +94,12 @@ struct DebugLineTableRowRef {
   }
 };
 
-/// Serializes the .debug_ranges and .debug_aranges DWARF sections.
-class DebugRangesSectionsWriter {
-public:
-  DebugRangesSectionsWriter(BinaryContext *BC);
+using RangesBufferVector = SmallVector<char, 16>;
 
-  /// Add ranges for CU matching \p CUOffset and return offset into section.
-  uint64_t addCURanges(uint64_t CUOffset, DebugAddressRangesVector &&Ranges);
+/// Serializes the .debug_ranges DWARF section.
+class DebugRangesSectionWriter {
+public:
+  DebugRangesSectionWriter(BinaryContext *BC);
 
   /// Add ranges with caching for \p Function.
   uint64_t
@@ -111,32 +110,16 @@ public:
   /// Add ranges and return offset into section.
   uint64_t addRanges(const DebugAddressRangesVector &Ranges);
 
-  /// Writes .debug_aranges with the added ranges to the MCObjectWriter.
-  void writeArangesSection(MCObjectWriter *Writer) const;
-
-  /// Resets the writer to a clear state.
-  void reset() {
-    CUAddressRanges.clear();
-  }
-
   /// Returns an offset of an empty address ranges list that is always written
   /// to .debug_ranges
   uint64_t getEmptyRangesOffset() const { return EmptyRangesOffset; }
 
-  /// Map DWARFCompileUnit index to ranges.
-  using CUAddressRangesType = std::map<uint64_t, DebugAddressRangesVector>;
-
-  /// Return ranges for a given CU.
-  const CUAddressRangesType &getCUAddressRanges() const {
-    return CUAddressRanges;
-  }
-
-  std::unique_ptr<SmallVectorImpl<char>> finalize() {
-    return std::unique_ptr<SmallVectorImpl<char>>(RangesBuffer.release());
+  std::unique_ptr<RangesBufferVector> finalize() {
+    return std::move(RangesBuffer);
   }
 
 private:
-  std::unique_ptr<SmallVector<char, 16>> RangesBuffer;
+  std::unique_ptr<RangesBufferVector> RangesBuffer;
 
   std::unique_ptr<raw_svector_ostream> RangesStream;
 
@@ -148,44 +131,73 @@ private:
   /// Starts with 16 since the first 16 bytes are reserved for an empty range.
   uint32_t SectionOffset{0};
 
+  /// Offset of an empty address ranges list.
+  static constexpr uint64_t EmptyRangesOffset{0};
+};
+
+/// Serializes the .debug_aranges DWARF section.
+class DebugARangesSectionWriter {
+public:
+  /// Add ranges for CU matching \p CUOffset.
+  void addCURanges(uint64_t CUOffset, DebugAddressRangesVector &&Ranges);
+
+  /// Writes .debug_aranges with the added ranges to the MCObjectWriter.
+  void writeARangesSection(MCObjectWriter *Writer) const;
+
+  /// Resets the writer to a clear state.
+  void reset() {
+    CUAddressRanges.clear();
+  }
+
+  /// Map DWARFCompileUnit index to ranges.
+  using CUAddressRangesType = std::map<uint64_t, DebugAddressRangesVector>;
+
+  /// Return ranges for a given CU.
+  const CUAddressRangesType &getCUAddressRanges() const {
+    return CUAddressRanges;
+  }
+
+private:
   /// Map from compile unit offset to the list of address intervals that belong
   /// to that compile unit. Each interval is a pair
   /// (first address, interval size).
   CUAddressRangesType CUAddressRanges;
 
   std::mutex CUAddressRangesMutex;
-
-  /// Offset of an empty address ranges list.
-  static constexpr uint64_t EmptyRangesOffset{0};
 };
 
-/// Serializes the .debug_loc DWARF section with LocationLists.
+using LocBufferVector = SmallVector<char, 16>;
+
+/// Serializes part of a .debug_loc DWARF section with LocationLists.
 class DebugLocWriter {
 public:
   DebugLocWriter(BinaryContext *BC);
 
   uint64_t addList(const DWARFDebugLoc::LocationList &LocList);
 
-  uint64_t getEmptyListOffset() const { return EmptyListOffset; }
-
-  std::unique_ptr<SmallVectorImpl<char>> finalize() {
-    return std::unique_ptr<SmallVectorImpl<char>>(LocBuffer.release());
+  std::unique_ptr<LocBufferVector> finalize() {
+    return std::move(LocBuffer);
   }
 
+  /// Offset of an empty location list.
+  static constexpr uint32_t EmptyListOffset = 0;
+
+  /// Value returned by addList if list is empty
+  /// Use 64 bits here so that a max 32 bit value can still
+  /// be stored while we use max 64 bit value as empty tag
+  static constexpr uint64_t EmptyListTag = -1;
+
 private:
-  std::unique_ptr<SmallVector<char, 16>> LocBuffer;
+  std::unique_ptr<LocBufferVector> LocBuffer;
 
   std::unique_ptr<raw_svector_ostream> LocStream;
 
   std::unique_ptr<MCObjectWriter> Writer;
 
-  std::mutex WriterMutex;
-
-  /// Offset of an empty location list.
-  static uint64_t const EmptyListOffset = 0;
-
   /// Current offset in the section (updated as new entries are written).
-  /// Starts with 16 since the first 16 bytes are reserved for an empty range.
+  /// Starts with 0 here since this only writes part of a full location lists
+  /// section. In the final section, the first 16 bytes are reserved for an
+  /// empty list.
   uint32_t SectionOffset{0};
 };
 
@@ -251,7 +263,7 @@ private:
   };
 
   struct AbbrevHash {
-    std::size_t operator()(const AbbrevAttrPatch &P) const {
+    size_t operator()(const AbbrevAttrPatch &P) const {
       return std::hash<uint64_t>()(((uint64_t)P.Abbrev << 16) + P.Attr);
     }
   };

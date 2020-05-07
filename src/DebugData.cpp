@@ -55,8 +55,8 @@ uint64_t writeAddressRanges(
 
 } // namespace
 
-DebugRangesSectionsWriter::DebugRangesSectionsWriter(BinaryContext *BC) {
-  RangesBuffer = llvm::make_unique<SmallVector<char, 16>>();
+DebugRangesSectionWriter::DebugRangesSectionWriter(BinaryContext *BC) {
+  RangesBuffer = llvm::make_unique<RangesBufferVector>();
   RangesStream = llvm::make_unique<raw_svector_ostream>(*RangesBuffer);
   Writer =
     std::unique_ptr<MCObjectWriter>(BC->createObjectWriter(*RangesStream));
@@ -65,17 +65,7 @@ DebugRangesSectionsWriter::DebugRangesSectionsWriter(BinaryContext *BC) {
   SectionOffset += writeAddressRanges(Writer.get(), DebugAddressRangesVector{});
 }
 
-uint64_t
-DebugRangesSectionsWriter::addCURanges(uint64_t CUOffset,
-                                       DebugAddressRangesVector &&Ranges) {
-  const auto RangesOffset = addRanges(Ranges);
-
-  std::lock_guard<std::mutex> Lock(CUAddressRangesMutex);
-  CUAddressRanges.emplace(CUOffset, std::move(Ranges));
-  return RangesOffset;
-}
-
-uint64_t DebugRangesSectionsWriter::addRanges(
+uint64_t DebugRangesSectionWriter::addRanges(
     const BinaryFunction *Function, DebugAddressRangesVector &&Ranges,
     const BinaryFunction *&CachedFunction,
     std::map<DebugAddressRangesVector, uint64_t> &CachedRanges) {
@@ -98,7 +88,7 @@ uint64_t DebugRangesSectionsWriter::addRanges(
 }
 
 uint64_t
-DebugRangesSectionsWriter::addRanges(const DebugAddressRangesVector &Ranges) {
+DebugRangesSectionWriter::addRanges(const DebugAddressRangesVector &Ranges) {
   if (Ranges.empty())
     return getEmptyRangesOffset();
 
@@ -112,7 +102,14 @@ DebugRangesSectionsWriter::addRanges(const DebugAddressRangesVector &Ranges) {
 }
 
 void
-DebugRangesSectionsWriter::writeArangesSection(MCObjectWriter *Writer) const {
+DebugARangesSectionWriter::addCURanges(uint64_t CUOffset,
+                                        DebugAddressRangesVector &&Ranges) {
+  std::lock_guard<std::mutex> Lock(CUAddressRangesMutex);
+  CUAddressRanges.emplace(CUOffset, std::move(Ranges));
+}
+
+void
+DebugARangesSectionWriter::writeARangesSection(MCObjectWriter *Writer) const {
   // For reference on the format of the .debug_aranges section, see the DWARF4
   // specification, section 6.1.4 Lookup by Address
   // http://www.dwarfstd.org/doc/DWARF4.pdf
@@ -152,25 +149,19 @@ DebugRangesSectionsWriter::writeArangesSection(MCObjectWriter *Writer) const {
 }
 
 DebugLocWriter::DebugLocWriter(BinaryContext *BC) {
-  LocBuffer = llvm::make_unique<SmallVector<char, 16>>();
+  LocBuffer = llvm::make_unique<LocBufferVector>();
   LocStream = llvm::make_unique<raw_svector_ostream>(*LocBuffer);
   Writer =
     std::unique_ptr<MCObjectWriter>(BC->createObjectWriter(*LocStream));
-
-  // Add an empty list as the first entry;
-  Writer->writeLE64(0);
-  Writer->writeLE64(0);
-  SectionOffset += 2 * 8;
 }
 
 // DWARF 4: 2.6.2
 uint64_t DebugLocWriter::addList(const DWARFDebugLoc::LocationList &LocList) {
   if (LocList.Entries.empty())
-    return getEmptyListOffset();
+    return EmptyListTag;
 
-  // Reading the SectionOffset and updating it should be atomic to guarantee
-  // unique and correct offsets in patches.
-  std::lock_guard<std::mutex> Lock(WriterMutex);
+  // Since there is a separate DebugLocWriter for each thread,
+  // we don't need a lock to read the SectionOffset and update it.
   const auto EntryOffset = SectionOffset;
 
   for (const auto &Entry : LocList.Entries) {

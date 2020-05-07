@@ -75,24 +75,40 @@ void DWARFRewriter::updateDebugInfo() {
       static_cast<DebugAbbrevPatcher *>(SectionPatchers[".debug_abbrev"].get());
   assert(DebugInfoPatcher && AbbrevPatcher && "Patchers not initialized.");
 
-  RangesSectionsWriter = llvm::make_unique<DebugRangesSectionsWriter>(&BC);
-  LocationListWriter = llvm::make_unique<DebugLocWriter>(&BC);
+  ARangesSectionWriter = llvm::make_unique<DebugARangesSectionWriter>();
+  RangesSectionWriter = llvm::make_unique<DebugRangesSectionWriter>(&BC);
 
-  auto processUnitDIE = [&](const DWARFDie DIE) {
+  size_t NumCUs = BC.DwCtx->getNumCompileUnits();
+  if (opts::NoThreads || opts::DeterministicDebugInfo) {
+    // Use single entry for efficiency when running single-threaded
+    NumCUs = 1;
+  }
+
+  LocListWritersByCU.resize(NumCUs);
+
+  for (size_t CUIndex = 0; CUIndex < NumCUs; ++CUIndex) {
+    LocListWritersByCU[CUIndex] = llvm::make_unique<DebugLocWriter>(&BC);
+  }
+
+  auto processUnitDIE = [&](size_t CUIndex, const DWARFDie DIE) {
     const BinaryFunction *CachedFunction = nullptr;
     std::map<DebugAddressRangesVector, uint64_t> CachedRanges{};
-    updateUnitDebugInfo(DIE, std::vector<const BinaryFunction *>{},
+    updateUnitDebugInfo(CUIndex, DIE, std::vector<const BinaryFunction *>{},
                         CachedFunction, CachedRanges);
   };
 
   if (opts::NoThreads || opts::DeterministicDebugInfo) {
-    for (auto &CU : BC.DwCtx->compile_units())
-      processUnitDIE(CU->getUnitDIE(false));
+    for (auto &CU : BC.DwCtx->compile_units()) {
+      processUnitDIE(0, CU->getUnitDIE(false));
+    }
   } else {
     // Update unit debug info in parallel
     auto &ThreadPool = ParallelUtilities::getThreadPool();
-    for (auto &CU : BC.DwCtx->compile_units())
-      ThreadPool.async(processUnitDIE, CU->getUnitDIE(false));
+    size_t CUIndex = 0;
+    for (auto &CU : BC.DwCtx->compile_units()) {
+      ThreadPool.async(processUnitDIE, CUIndex, CU->getUnitDIE(false));
+      CUIndex++;
+    }
 
     ThreadPool.wait();
   }
@@ -105,6 +121,7 @@ void DWARFRewriter::updateDebugInfo() {
 }
 
 void DWARFRewriter::updateUnitDebugInfo(
+    size_t CUIndex,
     const DWARFDie DIE, std::vector<const BinaryFunction *> FunctionStack,
     const BinaryFunction *&CachedFunction,
     std::map<DebugAddressRangesVector, uint64_t> &CachedRanges) {
@@ -115,7 +132,8 @@ void DWARFRewriter::updateUnitDebugInfo(
       const auto ModuleRanges = DIE.getAddressRanges();
       auto OutputRanges = BC.translateModuleAddressRanges(ModuleRanges);
       const auto RangesSectionOffset =
-      RangesSectionsWriter->addCURanges(DIE.getDwarfUnit()->getOffset(),
+      RangesSectionWriter->addRanges(OutputRanges);
+      ARangesSectionWriter->addCURanges(DIE.getDwarfUnit()->getOffset(),
                                         std::move(OutputRanges));
       updateDWARFObjectAddressRanges(DIE, RangesSectionOffset);
     }
@@ -150,7 +168,7 @@ void DWARFRewriter::updateUnitDebugInfo(
       // Update ranges.
       if (UsesRanges) {
         updateDWARFObjectAddressRanges(DIE,
-            RangesSectionsWriter->addRanges(FunctionRanges));
+            RangesSectionWriter->addRanges(FunctionRanges));
       } else {
         // Delay conversion of [LowPC, HighPC) into DW_AT_ranges if possible.
         const auto *Abbrev = DIE.getAbbreviationDeclarationPtr();
@@ -186,7 +204,7 @@ void DWARFRewriter::updateUnitDebugInfo(
   case dwarf::DW_TAG_catch_block:
     {
       auto RangesSectionOffset =
-        RangesSectionsWriter->getEmptyRangesOffset();
+        RangesSectionWriter->getEmptyRangesOffset();
       const BinaryFunction *Function =
         FunctionStack.empty() ? nullptr : FunctionStack.back();
       if (Function) {
@@ -199,7 +217,7 @@ void DWARFRewriter::updateUnitDebugInfo(
                    << Twine::utohexstr(DIE.getDwarfUnit()->getOffset()) << '\n';
           }
         );
-        RangesSectionOffset = RangesSectionsWriter->addRanges(
+        RangesSectionOffset = RangesSectionWriter->addRanges(
             Function, std::move(OutputRanges), CachedFunction, CachedRanges);
       }
       updateDWARFObjectAddressRanges(DIE, RangesSectionOffset);
@@ -217,7 +235,7 @@ void DWARFRewriter::updateUnitDebugInfo(
         Value = *V;
         if (Value.isFormClass(DWARFFormValue::FC_Constant) ||
             Value.isFormClass(DWARFFormValue::FC_SectionOffset)) {
-          auto LocListSectionOffset = LocationListWriter->getEmptyListOffset();
+          auto LocListOffset = DebugLocWriter::EmptyListTag;
           if (Function) {
             // Limit parsing to a single list to save memory.
             DWARFDebugLoc::LocationList LL;
@@ -226,9 +244,10 @@ void DWARFRewriter::updateUnitDebugInfo(
               Value.getAsSectionOffset().getValue();
 
             uint32_t LLOff = LL.Offset;
-            auto OptLL =
-                DIE.getDwarfUnit()->getContext().getOneDebugLocList(&LLOff);
-            if (!OptLL || OptLL->Entries.empty()) {
+            auto InputLL =
+              DIE.getDwarfUnit()->getContext().getOneDebugLocList(
+                  &LLOff, DIE.getDwarfUnit()->getBaseAddress()->Address);
+            if (!InputLL || InputLL->Entries.empty()) {
               errs() << "BOLT-WARNING: empty location list detected at 0x"
                      << Twine::utohexstr(LLOff) << " for DIE at 0x"
                      << Twine::utohexstr(DIE.getOffset()) << " in CU at 0x"
@@ -237,7 +256,7 @@ void DWARFRewriter::updateUnitDebugInfo(
             } else {
               const auto OutputLL =
                   Function->translateInputToOutputLocationList(
-                      *OptLL, *DIE.getDwarfUnit()->getBaseAddress());
+                      std::move(*InputLL));
               DEBUG(if (OutputLL.Entries.empty()) {
                 dbgs() << "BOLT-DEBUG: location list translated to an empty "
                           "one at 0x"
@@ -245,12 +264,19 @@ void DWARFRewriter::updateUnitDebugInfo(
                        << Twine::utohexstr(DIE.getDwarfUnit()->getOffset())
                        << '\n';
               });
-              LocListSectionOffset = LocationListWriter->addList(OutputLL);
+              LocListOffset = LocListWritersByCU[CUIndex]->addList(OutputLL);
             }
           }
 
-          std::lock_guard<std::mutex> Lock(DebugInfoPatcherMutex);
-          DebugInfoPatcher->addLE32Patch(AttrOffset, LocListSectionOffset);
+          if (LocListOffset != DebugLocWriter::EmptyListTag) {
+            std::lock_guard<std::mutex> Lock(LocListDebugInfoPatchesMutex);
+            LocListDebugInfoPatches.push_back(
+                {AttrOffset, CUIndex, LocListOffset});
+          } else {
+            std::lock_guard<std::mutex> Lock(DebugInfoPatcherMutex);
+            DebugInfoPatcher->addLE32Patch(AttrOffset,
+                                           DebugLocWriter::EmptyListOffset);
+          }
         } else {
           assert((Value.isFormClass(DWARFFormValue::FC_Exprloc) ||
                   Value.isFormClass(DWARFFormValue::FC_Block)) &&
@@ -282,7 +308,8 @@ void DWARFRewriter::updateUnitDebugInfo(
 
   // Recursively update each child.
   for (auto Child = DIE.getFirstChild(); Child; Child = Child.getSibling()) {
-    updateUnitDebugInfo(Child, FunctionStack, CachedFunction, CachedRanges);
+    updateUnitDebugInfo(CUIndex, Child, FunctionStack, CachedFunction,
+                        CachedRanges);
   }
 
   if (IsFunctionDef)
@@ -296,11 +323,6 @@ void DWARFRewriter::updateDWARFObjectAddressRanges(
   // compiler-generated functions).
   if (!DIE) {
     return;
-  }
-
-  if (opts::Verbosity >= 2 && DebugRangesOffset == -1U) {
-    errs() << "BOLT-WARNING: using invalid DW_AT_ranges for DIE at offset 0x"
-           << Twine::utohexstr(DIE.getOffset()) << '\n';
   }
 
   const auto *AbbreviationDecl = DIE.getAbbreviationDeclarationPtr();
@@ -344,64 +366,6 @@ void DWARFRewriter::updateDWARFObjectAddressRanges(
         errs() << "BOLT-WARNING: Cannot update ranges for DIE at offset 0x"
                << Twine::utohexstr(DIE.getOffset()) << '\n';
       }
-    }
-  }
-}
-
-void DWARFRewriter::updateDebugLineInfoForNonSimpleFunctions() {
-  for (auto &It : BC.getBinaryFunctions()) {
-    const auto &Function = It.second;
-
-    if (Function.isSimple())
-      continue;
-
-    auto ULT = Function.getDWARFUnitLineTable();
-    auto Unit = ULT.first;
-    auto LineTable = ULT.second;
-
-    if (!LineTable)
-      continue; // nothing to update for this function
-
-    std::vector<uint32_t> Results;
-    MCSectionELF *FunctionSection =
-        BC.Ctx->getELFSection(Function.getCodeSectionName(),
-                               ELF::SHT_PROGBITS,
-                               ELF::SHF_EXECINSTR | ELF::SHF_ALLOC);
-
-    uint64_t Address = It.first;
-    if (LineTable->lookupAddressRange(Address, Function.getMaxSize(),
-                                      Results)) {
-      auto &OutputLineTable =
-          BC.Ctx->getMCDwarfLineTable(Unit->getOffset()).getMCLineSections();
-      for (auto RowIndex : Results) {
-        const auto &Row = LineTable->Rows[RowIndex];
-        BC.Ctx->setCurrentDwarfLoc(
-            Row.File,
-            Row.Line,
-            Row.Column,
-            (DWARF2_FLAG_IS_STMT * Row.IsStmt) |
-            (DWARF2_FLAG_BASIC_BLOCK * Row.BasicBlock) |
-            (DWARF2_FLAG_PROLOGUE_END * Row.PrologueEnd) |
-            (DWARF2_FLAG_EPILOGUE_BEGIN * Row.EpilogueBegin),
-            Row.Isa,
-            Row.Discriminator,
-            Row.Address);
-        auto Loc = BC.Ctx->getCurrentDwarfLoc();
-        BC.Ctx->clearDwarfLocSeen();
-        OutputLineTable.addLineEntry(MCDwarfLineEntry{nullptr, Loc},
-                                     FunctionSection);
-      }
-      // Add an empty entry past the end of the function
-      // for end_sequence mark.
-      BC.Ctx->setCurrentDwarfLoc(0, 0, 0, 0, 0, 0,
-                                  Address + Function.getMaxSize());
-      auto Loc = BC.Ctx->getCurrentDwarfLoc();
-      BC.Ctx->clearDwarfLocSeen();
-      OutputLineTable.addLineEntry(MCDwarfLineEntry{nullptr, Loc},
-                                   FunctionSection);
-    } else {
-      DEBUG(dbgs() << "BOLT-DEBUG: Function " << Function
-                   << " has no associated line number information.\n");
     }
   }
 }
@@ -457,9 +421,8 @@ void DWARFRewriter::updateLineTableOffsets() {
 
     auto DbgInfoSection = BC.getUniqueSectionByName(".debug_info");
     assert(DbgInfoSection && ".debug_info section must exist");
-    auto *Zero = BC.registerNameAtAddress("Zero", 0, 0, 0);
     DbgInfoSection->addRelocation(LTOffset,
-                                  Zero,
+                                  nullptr,
                                   ELF::R_X86_64_32,
                                   Offset,
                                   0,
@@ -484,7 +447,7 @@ void DWARFRewriter::finalizeDebugSections() {
         *BC.STI, *BC.MRI, MCTargetOptions()));
     auto Writer = std::unique_ptr<MCObjectWriter>(MAB->createObjectWriter(OS));
 
-    RangesSectionsWriter->writeArangesSection(Writer.get());
+    ARangesSectionWriter->writeARangesSection(Writer.get());
     const auto &ARangesContents = OS.str();
 
     BC.registerOrUpdateNoteSection(".debug_aranges",
@@ -492,12 +455,12 @@ void DWARFRewriter::finalizeDebugSections() {
                                     ARangesContents.size());
   }
 
-  auto RangesSectionContents = RangesSectionsWriter->finalize();
+  auto RangesSectionContents = RangesSectionWriter->finalize();
   BC.registerOrUpdateNoteSection(".debug_ranges",
                                   copyByteArray(*RangesSectionContents),
                                   RangesSectionContents->size());
 
-  auto LocationListSectionContents = LocationListWriter->finalize();
+  auto LocationListSectionContents = makeFinalLocListsSection();
   BC.registerOrUpdateNoteSection(".debug_loc",
                                   copyByteArray(*LocationListSectionContents),
                                   LocationListSectionContents->size());
@@ -557,7 +520,7 @@ void DWARFRewriter::updateGdbIndexSection() {
 
   // Calculate the size of the new address table.
   uint32_t NewAddressTableSize = 0;
-  for (const auto &CURangesPair : RangesSectionsWriter->getCUAddressRanges()) {
+  for (const auto &CURangesPair : ARangesSectionWriter->getCUAddressRanges()) {
     const auto &Ranges = CURangesPair.second;
     NewAddressTableSize += Ranges.size() * 20;
   }
@@ -586,7 +549,7 @@ void DWARFRewriter::updateGdbIndexSection() {
   Buffer += AddressTableOffset - CUListOffset;
 
   // Generate new address table.
-  for (const auto &CURangesPair : RangesSectionsWriter->getCUAddressRanges()) {
+  for (const auto &CURangesPair : ARangesSectionWriter->getCUAddressRanges()) {
     const auto CUIndex = OffsetToIndexMap[CURangesPair.first];
     const auto &Ranges = CURangesPair.second;
     for (const auto &Range : Ranges) {
@@ -613,24 +576,37 @@ void DWARFRewriter::updateGdbIndexSection() {
 
 void
 DWARFRewriter::convertToRanges(const DWARFAbbreviationDeclaration *Abbrev) {
+  dwarf::Form HighPCForm = Abbrev->findAttribute(dwarf::DW_AT_high_pc)->Form;
   std::lock_guard<std::mutex> Lock(AbbrevPatcherMutex);
   AbbrevPatcher->addAttributePatch(Abbrev,
                                    dwarf::DW_AT_low_pc,
                                    dwarf::DW_AT_ranges,
                                    dwarf::DW_FORM_sec_offset);
-  AbbrevPatcher->addAttributePatch(Abbrev,
-                                   dwarf::DW_AT_high_pc,
-                                   dwarf::DW_AT_low_pc,
-                                   dwarf::DW_FORM_udata);
+  if (HighPCForm == dwarf::DW_FORM_addr ||
+      HighPCForm == dwarf::DW_FORM_data8) {
+    // LowPC must have 12 bytes, use indirect
+    AbbrevPatcher->addAttributePatch(Abbrev,
+                                     dwarf::DW_AT_high_pc,
+                                     dwarf::DW_AT_low_pc,
+                                     dwarf::DW_FORM_indirect);
+  } else if (HighPCForm == dwarf::DW_FORM_data4) {
+    // LowPC must have 8 bytes, use addr
+    AbbrevPatcher->addAttributePatch(Abbrev,
+                                     dwarf::DW_AT_high_pc,
+                                     dwarf::DW_AT_low_pc,
+                                     dwarf::DW_FORM_addr);
+  } else {
+    llvm_unreachable("unexpected form");
+  }
 }
 
 void DWARFRewriter::convertToRanges(DWARFDie DIE,
                                     const DebugAddressRangesVector &Ranges) {
   uint64_t RangesSectionOffset;
   if (Ranges.empty()) {
-    RangesSectionOffset = RangesSectionsWriter->getEmptyRangesOffset();
+    RangesSectionOffset = RangesSectionWriter->getEmptyRangesOffset();
   } else {
-    RangesSectionOffset = RangesSectionsWriter->addRanges(Ranges);
+    RangesSectionOffset = RangesSectionWriter->addRanges(Ranges);
   }
 
   convertToRanges(DIE, RangesSectionOffset);
@@ -651,6 +627,39 @@ void DWARFRewriter::convertPending(const DWARFAbbreviationDeclaration *Abbrev) {
   }
 
   ConvertedRangesAbbrevs.emplace(Abbrev);
+}
+
+std::unique_ptr<LocBufferVector> DWARFRewriter::makeFinalLocListsSection() {
+  auto LocBuffer = llvm::make_unique<LocBufferVector>();
+  auto LocStream = llvm::make_unique<raw_svector_ostream>(*LocBuffer);
+  auto Writer =
+    std::unique_ptr<MCObjectWriter>(BC.createObjectWriter(*LocStream));
+
+  uint32_t SectionOffset = 0;
+
+  // Add an empty list as the first entry;
+  Writer->writeLE64(0);
+  Writer->writeLE64(0);
+  SectionOffset += 2 * 8;
+
+  std::vector<uint32_t> SectionOffsetByCU(LocListWritersByCU.size());
+
+  for (size_t CUIndex = 0; CUIndex < LocListWritersByCU.size(); ++CUIndex) {
+    SectionOffsetByCU[CUIndex] = SectionOffset;
+    auto CurrCULocationLists = LocListWritersByCU[CUIndex]->finalize();
+    Writer->writeBytes(*CurrCULocationLists);
+    SectionOffset += CurrCULocationLists->size();
+  }
+
+  for (auto &Patch : LocListDebugInfoPatches) {
+    DebugInfoPatcher->addLE32Patch(
+      Patch.DebugInfoOffset,
+      SectionOffsetByCU[Patch.CUIndex]
+      + Patch.CUWriterOffset
+    );
+  }
+
+  return LocBuffer;
 }
 
 void DWARFRewriter::flushPendingRanges() {
@@ -712,6 +721,7 @@ void DWARFRewriter::convertToRanges(DWARFDie DIE,
       DIE, LowPCOffset, HighPCOffset, LowPCFormValue, HighPCFormValue);
 
   unsigned LowPCSize = 0;
+  assert(DIE.getDwarfUnit()->getAddressByteSize() == 8);
   if (HighPCFormValue.getForm() == dwarf::DW_FORM_addr ||
       HighPCFormValue.getForm() == dwarf::DW_FORM_data8) {
     LowPCSize = 12;
@@ -723,6 +733,13 @@ void DWARFRewriter::convertToRanges(DWARFDie DIE,
 
   std::lock_guard<std::mutex> Lock(DebugInfoPatcherMutex);
   DebugInfoPatcher->addLE32Patch(LowPCOffset, RangesSectionOffset);
-  DebugInfoPatcher->addUDataPatch(LowPCOffset + 4, 0, LowPCSize);
+  if (LowPCSize == 12) {
+    // Write an indirect 0 value for DW_AT_low_pc so that we can fill
+    // 12 bytes of space (see T56239836 for more details)
+    DebugInfoPatcher->addUDataPatch(LowPCOffset + 4, dwarf::DW_FORM_addr, 4);
+    DebugInfoPatcher->addLE64Patch(LowPCOffset + 8, 0);
+  } else {
+    DebugInfoPatcher->addLE64Patch(LowPCOffset + 4, 0);
+  }
 }
 

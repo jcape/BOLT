@@ -135,7 +135,7 @@ public:
     /// that suggests putting frequently executed chains first in the layout.
     LT_OPTIMIZE_CACHE,
     /// Block reordering guided by the extended TSP metric.
-    LT_OPTIMIZE_CACHE_PLUS,
+    LT_OPTIMIZE_EXT_TSP,
     /// Create clusters and use random order for them.
     LT_OPTIMIZE_SHUFFLE,
   };
@@ -143,21 +143,13 @@ public:
 private:
   void modifyFunctionLayout(BinaryFunction &Function,
                             LayoutType Type,
-                            bool MinBranchClusters,
-                            bool Split) const;
-
-  /// Split function in two: a part with warm or hot BBs and a part with never
-  /// executed BBs. The cold part is moved to a new BinaryFunction.
-  void splitFunction(BinaryFunction &Function) const;
-
-  bool IsAArch64{false};
-
+                            bool MinBranchClusters) const;
 public:
   explicit ReorderBasicBlocks(const cl::opt<bool> &PrintPass)
     : BinaryFunctionPass(PrintPass) { }
 
   const char *getName() const override {
-    return "reordering";
+    return "reorder-blocks";
   }
   bool shouldPrint(const BinaryFunction &BF) const override;
   void runOnFunctions(BinaryContext &BC) override;
@@ -186,6 +178,22 @@ class FinalizeFunctions : public BinaryFunctionPass {
     return "finalize-functions";
   }
   void runOnFunctions(BinaryContext &BC) override;
+};
+
+/// Perform any necessary adjustments for functions that do not fit into their
+/// original space in non-relocation mode.
+class CheckLargeFunctions : public BinaryFunctionPass {
+public:
+  explicit CheckLargeFunctions(const cl::opt<bool> &PrintPass)
+    : BinaryFunctionPass(PrintPass) { }
+
+  const char *getName() const override {
+    return "check-large-functions";
+  }
+
+  void runOnFunctions(BinaryContext &BC) override;
+
+  bool shouldOptimize(const BinaryFunction &BF) const override;
 };
 
 /// Convert and remove all BOLT-related annotations before LLVM code emission.

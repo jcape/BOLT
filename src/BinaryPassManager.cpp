@@ -22,6 +22,7 @@
 #include "Passes/RegReAssign.h"
 #include "Passes/ReorderFunctions.h"
 #include "Passes/ReorderData.h"
+#include "Passes/SplitFunctions.h"
 #include "Passes/StokeInfo.h"
 #include "Passes/RetpolineInsertion.h"
 #include "Passes/LFenceInsertion.h"
@@ -104,7 +105,7 @@ PrintFOP("print-fop",
   cl::Hidden,
   cl::cat(BoltOptCategory));
 
-static cl::opt<bool>
+cl::opt<bool>
 PrintFinalized("print-finalized",
   cl::desc("print function after CFG is finalized"),
   cl::Hidden,
@@ -166,7 +167,7 @@ PrintPeepholes("print-peepholes",
   cl::Hidden,
   cl::cat(BoltOptCategory));
 
-static cl::opt<bool>
+cl::opt<bool>
 PrintReordered("print-reordered",
   cl::desc("print functions after layout optimization"),
   cl::ZeroOrMore,
@@ -190,6 +191,13 @@ PrintSCTC("print-sctc",
 static cl::opt<bool>
 PrintSimplifyROLoads("print-simplify-rodata-loads",
   cl::desc("print functions after simplification of RO data loads"),
+  cl::ZeroOrMore,
+  cl::Hidden,
+  cl::cat(BoltOptCategory));
+
+static cl::opt<bool>
+PrintSplit("print-split",
+  cl::desc("print functions after code splitting"),
   cl::ZeroOrMore,
   cl::Hidden,
   cl::cat(BoltOptCategory));
@@ -401,8 +409,6 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
 
   Manager.registerPass(llvm::make_unique<IndirectCallPromotion>(PrintICP));
 
-  Manager.registerPass(llvm::make_unique<Peepholes>(PrintPeepholes));
-
   Manager.registerPass(
       llvm::make_unique<JTFootprintReduction>(PrintJTFootprintReduction),
       opts::JTFootprintReductionFlag);
@@ -423,11 +429,11 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
 
   Manager.registerPass(llvm::make_unique<ReorderBasicBlocks>(PrintReordered));
 
-  Manager.registerPass(llvm::make_unique<Peepholes>(PrintPeepholes));
-
   Manager.registerPass(
     llvm::make_unique<EliminateUnreachableBlocks>(PrintUCE),
     opts::EliminateUnreachable);
+
+  Manager.registerPass(llvm::make_unique<SplitFunctions>(PrintSplit));
 
   // This pass syncs local branches with CFG. If any of the following
   // passes breaks the sync - they either need to re-run the pass or
@@ -462,6 +468,8 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
   Manager.registerPass(
       llvm::make_unique<SimplifyConditionalTailCalls>(PrintSCTC),
       opts::SimplifyConditionalTailCalls);
+
+  Manager.registerPass(llvm::make_unique<Peepholes>(PrintPeepholes));
 
   Manager.registerPass(llvm::make_unique<AlignerPass>());
 
@@ -501,6 +509,12 @@ void BinaryFunctionPassManager::runAllPasses(BinaryContext &BC) {
   // after this point.
   Manager.registerPass(
     llvm::make_unique<InstructionLowering>(PrintAfterLowering));
+
+  // In non-relocation mode, mark functions that do not fit into their original
+  // space as non-simple if we have to (e.g. for correct debug info update).
+  // NOTE: this pass depends on finalized code.
+  if (!BC.HasRelocations)
+    Manager.registerPass(llvm::make_unique<CheckLargeFunctions>(NeverPrint));
 
   Manager.registerPass(llvm::make_unique<LowerAnnotations>(NeverPrint));
 

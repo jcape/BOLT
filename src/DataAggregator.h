@@ -53,7 +53,7 @@ class BoltAddressTranslation;
 class DataAggregator : public DataReader {
 
   struct PerfBranchSample {
-    SmallVector<LBREntry, 16> LBR;
+    SmallVector<LBREntry, 32> LBR;
     uint64_t PC;
   };
 
@@ -136,6 +136,10 @@ class DataAggregator : public DataReader {
   PerfProcessInfo MMapEventsPPI;
   PerfProcessInfo TaskEventsPPI;
 
+  /// Kernel VM starts at fixed based address
+  /// https://www.kernel.org/doc/Documentation/x86/x86_64/mm.txt
+  static constexpr uint64_t KernelBaseAddr = 0xffff800000000000;
+
   /// Current list of created temporary files
   std::vector<std::string> TempFiles;
 
@@ -157,6 +161,7 @@ class DataAggregator : public DataReader {
     pid_t PID{-1LL};
     uint64_t BaseAddress;
     uint64_t Size;
+    uint64_t Offset;
     bool Forked{false};
     uint64_t Time{0ULL}; // time in micro seconds
   };
@@ -376,7 +381,11 @@ class DataAggregator : public DataReader {
   /// conflicts.
   void adjustAddress(uint64_t &Address, const MMapInfo &MMI) const {
     if (Address >= MMI.BaseAddress && Address < MMI.BaseAddress + MMI.Size) {
-      Address -= MMI.BaseAddress;
+      // NOTE: Assumptions about the binary segment load table (PH for ELF)
+      //  Segment file offset equals virtual address (which is true for .so)
+      //  There aren't multiple executable segments loaded because MMapInfo
+      //  doesn't support them.
+      Address -= MMI.BaseAddress - MMI.Offset;
     } else if (Address < MMI.Size) {
       // Make sure the address is not treated as belonging to the binary.
       Address = (-1ULL);
@@ -388,6 +397,9 @@ class DataAggregator : public DataReader {
     adjustAddress(LBR.From, MMI);
     adjustAddress(LBR.To, MMI);
   }
+
+  /// Ignore kernel/user transition LBR if requested
+  bool ignoreKernelInterrupt(LBREntry &LBR) const;
 
 public:
   DataAggregator(raw_ostream &Diag, StringRef BinaryName)
@@ -419,6 +431,9 @@ public:
 
   /// Dump data structures into a file readable by llvm-bolt
   std::error_code writeAggregatedFile() const;
+
+  /// Filter out binaries based on PID
+  void filterBinaryMMapInfo();
 
   /// Parse profile and mark functions/objects with profile.
   /// Don't assign profile to functions yet.

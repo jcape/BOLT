@@ -81,10 +81,26 @@ private:
   MCSymbol *Label{nullptr};
 
   /// [Begin, End) address range for this block in the output binary.
-  std::pair<uint64_t, uint64_t> OutputAddressRange{0, 0};
+  std::pair<uint32_t, uint32_t> OutputAddressRange{0, 0};
 
   /// Original offset range of the basic block in the function.
   std::pair<uint32_t, uint32_t> InputRange{INVALID_OFFSET, INVALID_OFFSET};
+
+  /// Map input offset (from function start) of an instruction to an output
+  /// symbol. Enables writing BOLT address translation tables used for mapping
+  /// control transfer in the output binary back to the original binary.
+  using LocSymsTy = std::vector<std::pair<uint32_t, const MCSymbol *>>;
+  std::unique_ptr<LocSymsTy> LocSyms;
+
+  /// After output/codegen, map output offsets of instructions in this basic
+  /// block to instruction offsets in the original function. Note that the
+  /// output basic block could be different from the input basic block.
+  /// We only map instruction of interest, such as calls, and sdt markers.
+  ///
+  /// We store the offset array in a basic block to facilitate BAT tables
+  /// generation. Otherwise, the mapping could be done at function level.
+  using OffsetTranslationTableTy = std::vector<std::pair<uint32_t, uint32_t>>;
+  std::unique_ptr<OffsetTranslationTableTy> OffsetTranslationTable;
 
   /// Alignment requirements for the block.
   uint32_t Alignment{1};
@@ -108,10 +124,6 @@ private:
 
   /// CFI state at the entry to this basic block.
   int32_t CFIState{-1};
-
-  /// True if this basic block is (potentially) an external entry point into
-  /// the function.
-  bool IsEntryPoint{false};
 
   /// In cases where the parent function has been split, IsCold == true means
   /// this BB will be allocated outside its parent function.
@@ -160,21 +172,35 @@ public:
   using reverse_iterator       = std::reverse_iterator<iterator>;
   using const_reverse_iterator = std::reverse_iterator<const_iterator>;
 
-  bool         empty()            const { return Instructions.empty(); }
-  size_t       size()             const { return Instructions.size(); }
-  MCInst       &front()                 { return Instructions.front();  }
-  MCInst       &back()                  { return Instructions.back();   }
-  const MCInst &front()           const { return Instructions.front();  }
-  const MCInst &back()            const { return Instructions.back();   }
+  bool         empty()            const { assert(hasInstructions());
+                                          return Instructions.empty(); }
+  size_t       size()             const { assert(hasInstructions());
+                                          return Instructions.size(); }
+  MCInst       &front()                 { assert(hasInstructions());
+                                          return Instructions.front();  }
+  MCInst       &back()                  { assert(hasInstructions());
+                                          return Instructions.back();   }
+  const MCInst &front()           const { assert(hasInstructions());
+                                          return Instructions.front();  }
+  const MCInst &back()            const { assert(hasInstructions());
+                                          return Instructions.back();   }
 
-  iterator                begin()       { return Instructions.begin();  }
-  const_iterator          begin() const { return Instructions.begin();  }
-  iterator                end  ()       { return Instructions.end();    }
-  const_iterator          end  () const { return Instructions.end();    }
-  reverse_iterator       rbegin()       { return Instructions.rbegin(); }
-  const_reverse_iterator rbegin() const { return Instructions.rbegin(); }
-  reverse_iterator       rend  ()       { return Instructions.rend();   }
-  const_reverse_iterator rend  () const { return Instructions.rend();   }
+  iterator                begin()       { assert(hasInstructions());
+                                          return Instructions.begin();  }
+  const_iterator          begin() const { assert(hasInstructions());
+                                          return Instructions.begin();  }
+  iterator                end  ()       { assert(hasInstructions());
+                                          return Instructions.end();    }
+  const_iterator          end  () const { assert(hasInstructions());
+                                          return Instructions.end();    }
+  reverse_iterator       rbegin()       { assert(hasInstructions());
+                                          return Instructions.rbegin(); }
+  const_reverse_iterator rbegin() const { assert(hasInstructions());
+                                          return Instructions.rbegin(); }
+  reverse_iterator       rend  ()       { assert(hasInstructions());
+                                          return Instructions.rend();   }
+  const_reverse_iterator rend  () const { assert(hasInstructions());
+                                          return Instructions.rend();   }
 
   // CFG iterators.
   using pred_iterator        = std::vector<BinaryBasicBlock *>::iterator;
@@ -247,33 +273,43 @@ public:
   bool               lp_empty() const { return LandingPads.empty();   }
 
   inline iterator_range<iterator> instructions() {
+    assert(hasInstructions());
     return iterator_range<iterator>(begin(), end());
   }
   inline iterator_range<const_iterator> instructions() const {
+    assert(hasInstructions());
     return iterator_range<const_iterator>(begin(), end());
   }
   inline iterator_range<pred_iterator> predecessors() {
+    assert(hasCFG());
     return iterator_range<pred_iterator>(pred_begin(), pred_end());
   }
   inline iterator_range<const_pred_iterator> predecessors() const {
+    assert(hasCFG());
     return iterator_range<const_pred_iterator>(pred_begin(), pred_end());
   }
   inline iterator_range<succ_iterator> successors() {
+    assert(hasCFG());
     return iterator_range<succ_iterator>(succ_begin(), succ_end());
   }
   inline iterator_range<const_succ_iterator> successors() const {
+    assert(hasCFG());
     return iterator_range<const_succ_iterator>(succ_begin(), succ_end());
   }
   inline iterator_range<throw_iterator> throwers() {
+    assert(hasCFG());
     return iterator_range<throw_iterator>(throw_begin(), throw_end());
   }
   inline iterator_range<const_throw_iterator> throwers() const {
+    assert(hasCFG());
     return iterator_range<const_throw_iterator>(throw_begin(), throw_end());
   }
   inline iterator_range<lp_iterator> landing_pads() {
+    assert(hasCFG());
     return iterator_range<lp_iterator>(lp_begin(), lp_end());
   }
   inline iterator_range<const_lp_iterator> landing_pads() const {
+    assert(hasCFG());
     return iterator_range<const_lp_iterator>(lp_begin(), lp_end());
   }
 
@@ -658,13 +694,9 @@ public:
   /// Apply a given \p Ratio to the profile information of this basic block.
   void adjustExecutionCount(double Ratio);
 
-  bool isEntryPoint() const {
-    return IsEntryPoint;
-  }
-
-  void setEntryPoint(bool Value = true) {
-    IsEntryPoint = Value;
-  }
+  /// Return true if the basic block is an entry point into the function
+  /// (either primary or secondary).
+  bool isEntryPoint() const;
 
   bool isValid() const {
     return IsValid;
@@ -816,6 +848,31 @@ public:
     return OutputAddressRange;
   }
 
+  /// Update addresses of special instructions inside this basic block.
+  void updateOutputValues(const MCAsmLayout &Layout);
+
+  /// Return mapping of input offsets to symbols in the output.
+  LocSymsTy &getLocSyms() {
+    return LocSyms ? *LocSyms : *(LocSyms = std::make_unique<LocSymsTy>());
+  }
+
+  /// Return mapping of input offsets to symbols in the output.
+  const LocSymsTy &getLocSyms() const {
+    return const_cast<BinaryBasicBlock *>(this)->getLocSyms();
+  }
+
+  /// Return offset translation table for the basic block.
+  OffsetTranslationTableTy &getOffsetTranslationTable() {
+    return OffsetTranslationTable ?
+      *OffsetTranslationTable :
+      *(OffsetTranslationTable = std::make_unique<OffsetTranslationTableTy>());
+  }
+
+  /// Return offset translation table for the basic block.
+  const OffsetTranslationTableTy &getOffsetTranslationTable() const {
+    return const_cast<BinaryBasicBlock *>(this)->getOffsetTranslationTable();
+  }
+
   /// Return size of the basic block in the output binary.
   uint64_t getOutputSize() const {
     return OutputAddressRange.second - OutputAddressRange.first;
@@ -895,6 +952,12 @@ public:
     return getFunction();
   }
 
+  /// Return true if the containing function is in CFG state.
+  bool hasCFG() const;
+
+  /// Return true if the containing function is in a state with instructions.
+  bool hasInstructions() const;
+
 private:
   void adjustNumPseudos(const MCInst &Inst, int Sign);
 
@@ -935,7 +998,25 @@ private:
   void setIndex(unsigned I) {
     Index = I;
   }
+
+  template<typename T> void clearList(T& List) {
+    T TempList;
+    TempList.swap(List);
+  }
+
+  /// Release memory taken by CFG edges and instructions.
+  void releaseCFG() {
+    clearList(Predecessors);
+    clearList(Successors);
+    clearList(Throwers);
+    clearList(LandingPads);
+    clearList(BranchInfo);
+    clearList(Instructions);
+  }
 };
+
+/// Keep the size of the BinaryBasicBlock within a reasonable size class.
+static_assert(sizeof(BinaryBasicBlock) <= 256, "");
 
 bool operator<(const BinaryBasicBlock &LHS, const BinaryBasicBlock &RHS);
 

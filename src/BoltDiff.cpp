@@ -44,6 +44,14 @@ PrintUnmapped("print-unmapped",
   cl::cat(BoltDiffCategory));
 
 static cl::opt<bool>
+PrintProfiledUnmapped("print-profiled-unmapped",
+  cl::desc("print functions that have profile in binary 1 but do not "
+           "in binary 2"),
+  cl::init(false),
+  cl::ZeroOrMore,
+  cl::cat(BoltDiffCategory));
+
+static cl::opt<bool>
 PrintDiffCFG("print-diff-cfg",
   cl::desc("print the CFG of important functions that changed in "
            "binary 2"),
@@ -157,7 +165,7 @@ class RewriteInstanceDiff {
   // Structures for our 3 matching strategies: by name, by hash and by lto name,
   // from the strongest to the weakest bind between two functions
   StringMap<const BinaryFunction *> NameLookup;
-  DenseMap<std::size_t, const BinaryFunction *> HashLookup;
+  DenseMap<size_t, const BinaryFunction *> HashLookup;
   StringMap<const BinaryFunction *> LTONameLookup1;
   StringMap<const BinaryFunction *> LTONameLookup2;
 
@@ -209,13 +217,13 @@ class RewriteInstanceDiff {
       const auto &Function = BFI.second;
       const auto Score = getNormalizedScore(Function, RI1);
       LargestBin1.insert(std::make_pair<>(Score, &Function));
-      for (const auto &Name : Function.getNames()) {
+      for (const auto Name : Function.getNames()) {
         if (auto OptionalLTOName = getLTOCommonName(Name))
           LTOName = *OptionalLTOName;
         NameLookup[Name] = &Function;
       }
       if (opts::MatchByHash && Function.hasCFG())
-        HashLookup[Function.hash(true, true)] = &Function;
+        HashLookup[Function.computeHash(/*UseDFS=*/true)] = &Function;
       if (opts::IgnoreLTOSuffix && !LTOName.empty()) {
         if (!LTONameLookup1.count(LTOName))
           LTONameLookup1[LTOName] = &Function;
@@ -229,7 +237,7 @@ class RewriteInstanceDiff {
       const auto &Function = BFI.second;
       const auto Score = getNormalizedScore(Function, RI2);
       LargestBin2.insert(std::make_pair<>(Score, &Function));
-      for (const auto &Name : Function.getNames()) {
+      for (const auto Name : Function.getNames()) {
         if (auto OptionalLTOName = getLTOCommonName(Name))
           LTOName = *OptionalLTOName;
       }
@@ -244,12 +252,14 @@ class RewriteInstanceDiff {
   /// Match functions in binary 2 with functions in binary 1
   void matchFunctions() {
     outs() << "BOLT-DIFF: Mapping functions in Binary2 to Binary1\n";
+    uint64_t BothHaveProfile = 0ull;
+    std::set<const BinaryFunction *> Bin1ProfiledMapped;
 
     for (const auto &BFI2 : RI2.BC->getBinaryFunctions()) {
       const auto &Function2 = BFI2.second;
       StringRef LTOName;
       bool Match = false;
-      for (const auto &Name : Function2.getNames()) {
+      for (const auto Name : Function2.getNames()) {
         auto Iter = NameLookup.find(Name);
         if (auto OptionalLTOName = getLTOCommonName(Name))
           LTOName = *OptionalLTOName;
@@ -258,16 +268,24 @@ class RewriteInstanceDiff {
         FuncMap.insert(std::make_pair<>(&Function2, Iter->second));
         Bin1MappedFuncs.insert(Iter->second);
         Bin2MappedFuncs.insert(&Function2);
+        if (Function2.hasValidProfile() && Iter->second->hasValidProfile()) {
+          ++BothHaveProfile;
+          Bin1ProfiledMapped.insert(Iter->second);
+        }
         Match = true;
         break;
       }
       if (Match || !Function2.hasCFG())
         continue;
-      auto Iter = HashLookup.find(Function2.hash(true, true));
+      auto Iter = HashLookup.find(Function2.computeHash(/*UseDFS*/true));
       if (Iter != HashLookup.end()) {
         FuncMap.insert(std::make_pair<>(&Function2, Iter->second));
         Bin1MappedFuncs.insert(Iter->second);
         Bin2MappedFuncs.insert(&Function2);
+        if (Function2.hasValidProfile() && Iter->second->hasValidProfile()) {
+          ++BothHaveProfile;
+          Bin1ProfiledMapped.insert(Iter->second);
+        }
         continue;
       }
       if (LTOName.empty())
@@ -277,7 +295,38 @@ class RewriteInstanceDiff {
         FuncMap.insert(std::make_pair<>(&Function2, LTOIter->second));
         Bin1MappedFuncs.insert(LTOIter->second);
         Bin2MappedFuncs.insert(&Function2);
+        if (Function2.hasValidProfile() && LTOIter->second->hasValidProfile()) {
+          ++BothHaveProfile;
+          Bin1ProfiledMapped.insert(LTOIter->second);
+        }
       }
+    }
+    PrintProgramStats PPS(opts::NeverPrint);
+    outs() << "* BOLT-DIFF: Starting print program stats pass for binary 1\n";
+    PPS.runOnFunctions(*RI1.BC);
+    outs() << "* BOLT-DIFF: Starting print program stats pass for binary 2\n";
+    PPS.runOnFunctions(*RI2.BC);
+    outs() << "=====\n";
+    outs() << "Inputs share " << BothHaveProfile
+           << " functions with valid profile.\n";
+    if (opts::PrintProfiledUnmapped) {
+      outs() << "\nFunctions in profile 1 that are missing in the profile 2:\n";
+      std::vector<const BinaryFunction *> Unmapped;
+      for (const auto &BFI : RI1.BC->getBinaryFunctions()) {
+        const auto &Function = BFI.second;
+        if (!Function.hasValidProfile() || Bin1ProfiledMapped.count(&Function))
+          continue;
+        Unmapped.emplace_back(&Function);
+      }
+      std::sort(Unmapped.begin(), Unmapped.end(),
+                [&](const BinaryFunction *A, const BinaryFunction *B) {
+                  return A->getFunctionScore() > B->getFunctionScore();
+                });
+      for (auto Function : Unmapped) {
+        outs() << Function->getPrintName() << " : ";
+        outs() << Function->getFunctionScore() << "\n";
+      }
+      outs() << "=====\n";
     }
   }
 
@@ -519,7 +568,8 @@ class RewriteInstanceDiff {
     for (auto I = LargestDiffs.rbegin(), E = LargestDiffs.rend(); I != E; ++I) {
       const auto &MapEntry = I->second;
       if (opts::IgnoreUnchanged &&
-          MapEntry.second->hash(true, true) == MapEntry.first->hash(true, true))
+          MapEntry.second->computeHash(/*UseDFS=*/true) ==
+          MapEntry.first->computeHash(/*UseDFS=*/true))
         continue;
       const auto &Scores = ScoreMap[MapEntry.first];
       outs() << "Function " << MapEntry.first->getDemangledName();
@@ -531,8 +581,8 @@ class RewriteInstanceDiff {
              << "%\t(Difference: ";
       printColoredPercentage((Scores.second - Scores.first) * 100.0);
       outs() << ")";
-      if (MapEntry.second->hash(true, true) !=
-          MapEntry.first->hash(true, true)) {
+      if (MapEntry.second->computeHash(/*UseDFS=*/true) !=
+          MapEntry.first->computeHash(/*UseDFS=*/true)) {
         outs() << "\t[Functions have different contents]";
         if (opts::PrintDiffCFG) {
           outs() << "\n *** CFG for function in binary 1:\n";

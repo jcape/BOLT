@@ -247,7 +247,7 @@ LongJmpPass::replaceTargetWithStub(BinaryBasicBlock &BB, MCInst &Inst,
       assert(TgtBB == nullptr);
       StubBB->setIsCold(BB.isCold());
       // Set as entry point because this block is valid but we have no preds
-      StubBB->setEntryPoint(true);
+      StubBB->getFunction()->addEntryPoint(*StubBB);
     }
   }
   BC.MIB->replaceBranchTarget(Inst, StubSymbol, BC.Ctx.get());
@@ -422,9 +422,10 @@ uint64_t LongJmpPass::getSymbolAddress(const BinaryContext &BC,
     assert (Iter != BBAddresses.end() && "Unrecognized BB");
     return Iter->second;
   }
-  auto *TargetFunc = BC.getFunctionForSymbol(Target);
+  uint64_t EntryID{0};
+  auto *TargetFunc = BC.getFunctionForSymbol(Target, &EntryID);
   auto Iter = HotAddresses.find(TargetFunc);
-  if (Iter == HotAddresses.end()) {
+  if (Iter == HotAddresses.end() || (TargetFunc && EntryID)) {
     // Look at BinaryContext's resolution for this symbol - this is a symbol not
     // mapped to a BinaryFunction
     auto ValueOrError = BC.getSymbolValue(*Target);

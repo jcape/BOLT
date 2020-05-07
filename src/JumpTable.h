@@ -56,10 +56,10 @@ public:
   };
 
   /// Size of the entry used for storage.
-  std::size_t EntrySize;
+  size_t EntrySize;
 
   /// Size of the entry size we will write (we may use a more compact layout)
-  std::size_t OutputEntrySize;
+  size_t OutputEntrySize;
 
   /// The type of this jump table.
   JumpTableType Type;
@@ -89,9 +89,9 @@ public:
 
 private:
   /// Constructor should only be called by a BinaryContext.
-  JumpTable(StringRef Name,
+  JumpTable(MCSymbol &Symbol,
             uint64_t Address,
-            std::size_t EntrySize,
+            size_t EntrySize,
             JumpTableType Type,
             LabelMapType &&Labels,
             BinaryFunction &BF,
@@ -121,11 +121,6 @@ public:
 
   /// Update jump table at its original location.
   void updateOriginal();
-
-  /// Emit jump table data. Callee supplies sections for the data.
-  /// Return the number of total bytes emitted.
-  uint64_t emit(MCStreamer *Streamer, MCSection *HotSection,
-                MCSection *ColdSection);
 
   /// Print for debugging purposes.
   virtual void print(raw_ostream &OS) const override;

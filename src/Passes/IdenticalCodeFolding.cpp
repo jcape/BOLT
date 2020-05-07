@@ -147,14 +147,11 @@ bool isInstrEquivalentWith(const MCInst &InstA, const BinaryBasicBlock &BBA,
 /// Returns true if this function has identical code and CFG with
 /// the given function \p BF.
 ///
-/// If \p IgnoreSymbols is set to true, then symbolic operands are ignored
-/// during comparison.
-///
-/// If \p UseDFS is set to true, then compute DFS of each function and use
-/// is for CFG equivalency. Potentially it will help to catch more cases,
-/// but is slower.
+/// If \p CongruentSymbols is set to true, then symbolic operands that reference
+/// potentially identical but different functions are ignored during the
+/// comparison.
 bool isIdenticalWith(const BinaryFunction &A, const BinaryFunction &B,
-                     bool IgnoreSymbols, bool UseDFS) {
+                     bool CongruentSymbols) {
   assert(A.hasCFG() && B.hasCFG() && "both functions should have CFG");
 
   // Compare the two functions, one basic block at a time.
@@ -170,8 +167,8 @@ bool isIdenticalWith(const BinaryFunction &A, const BinaryFunction &B,
     return false;
 
   // Process both functions in either DFS or existing order.
-  const auto &OrderA = UseDFS ? A.dfs() : A.getLayout();
-  const auto &OrderB = UseDFS ? B.dfs() : B.getLayout();
+  const auto &OrderA = opts::UseDFS ? A.dfs() : A.getLayout();
+  const auto &OrderB = opts::UseDFS ? B.dfs() : B.getLayout();
 
   const auto &BC = A.getBinaryContext();
 
@@ -199,73 +196,77 @@ bool isIdenticalWith(const BinaryFunction &A, const BinaryFunction &B,
     auto I = BB->begin(), E = BB->end();
     auto OtherI = OtherBB->begin(), OtherE = OtherBB->end();
     while (I != E && OtherI != OtherE) {
+      // Compare symbols.
+      auto AreSymbolsIdentical = [&] (const MCSymbol *SymbolA,
+                                      const MCSymbol *SymbolB) {
+        if (SymbolA == SymbolB)
+          return true;
 
-      bool Identical;
-      if (IgnoreSymbols) {
-        Identical =
-          isInstrEquivalentWith(*I, *BB, *OtherI, *OtherBB,
-                                [](const MCSymbol *A, const MCSymbol *B) {
-                                  return true;
-                                });
-      } else {
-        // Compare symbols.
-        auto AreSymbolsIdentical = [&] (const MCSymbol *SymbolA,
-                                        const MCSymbol *SymbolB) {
-          if (SymbolA == SymbolB)
+        // All local symbols are considered identical since they affect a
+        // control flow and we check the control flow separately.
+        // If a local symbol is escaped, then the function (potentially) has
+        // multiple entry points and we exclude such functions from
+        // comparison.
+        if (SymbolA->isTemporary() && SymbolB->isTemporary())
+          return true;
+
+        // Compare symbols as functions.
+        uint64_t EntryIDA{0};
+        uint64_t EntryIDB{0};
+        const auto *FunctionA = BC.getFunctionForSymbol(SymbolA, &EntryIDA);
+        const auto *FunctionB = BC.getFunctionForSymbol(SymbolB, &EntryIDB);
+        if (FunctionA && EntryIDA)
+          FunctionA = nullptr;
+        if (FunctionB && EntryIDB)
+          FunctionB = nullptr;
+        if (FunctionA && FunctionB) {
+          // Self-referencing functions and recursive calls.
+          if (FunctionA == &A && FunctionB == &B)
             return true;
 
-          // All local symbols are considered identical since they affect a
-          // control flow and we check the control flow separately.
-          // If a local symbol is escaped, then the function (potentially) has
-          // multiple entry points and we exclude such functions from
-          // comparison.
-          if (SymbolA->isTemporary() && SymbolB->isTemporary())
-            return true;
+          // Functions with different hash values can never become identical,
+          // hence A and B are different.
+          if (CongruentSymbols)
+            return FunctionA->getHash() == FunctionB->getHash();
 
-          // Compare symbols as functions.
-          const auto *FunctionA = BC.getFunctionForSymbol(SymbolA);
-          const auto *FunctionB = BC.getFunctionForSymbol(SymbolB);
-          if (FunctionA && FunctionB) {
-            // Self-referencing functions and recursive calls.
-            if (FunctionA == &A && FunctionB == &B)
-              return true;
-            return FunctionA == FunctionB;
-          }
+          return FunctionA == FunctionB;
+        }
 
-          // Check if symbols are jump tables.
-          auto *SIA = BC.getBinaryDataByName(SymbolA->getName());
-          if (!SIA)
-            return false;
-          auto *SIB = BC.getBinaryDataByName(SymbolB->getName());
-          if (!SIB)
-            return false;
+        // One of the symbols represents a function, the other one does not.
+        if (FunctionA != FunctionB) {
+          return false;
+        }
 
-          assert((SIA->getAddress() != SIB->getAddress()) &&
-                 "different symbols should not have the same value");
+        // Check if symbols are jump tables.
+        auto *SIA = BC.getBinaryDataByName(SymbolA->getName());
+        if (!SIA)
+          return false;
+        auto *SIB = BC.getBinaryDataByName(SymbolB->getName());
+        if (!SIB)
+          return false;
 
-          const auto *JumpTableA =
-             A.getJumpTableContainingAddress(SIA->getAddress());
-          if (!JumpTableA)
-            return false;
+        assert((SIA->getAddress() != SIB->getAddress()) &&
+               "different symbols should not have the same value");
 
-          const auto *JumpTableB =
-             B.getJumpTableContainingAddress(SIB->getAddress());
-          if (!JumpTableB)
-            return false;
+        const auto *JumpTableA =
+           A.getJumpTableContainingAddress(SIA->getAddress());
+        if (!JumpTableA)
+          return false;
 
-          if ((SIA->getAddress() - JumpTableA->getAddress()) !=
-              (SIB->getAddress() - JumpTableB->getAddress()))
-            return false;
+        const auto *JumpTableB =
+           B.getJumpTableContainingAddress(SIB->getAddress());
+        if (!JumpTableB)
+          return false;
 
-          return equalJumpTables(*JumpTableA, *JumpTableB, A, B);
-        };
+        if ((SIA->getAddress() - JumpTableA->getAddress()) !=
+            (SIB->getAddress() - JumpTableB->getAddress()))
+          return false;
 
-        Identical =
-          isInstrEquivalentWith(*I, *BB, *OtherI, *OtherBB,
-                                AreSymbolsIdentical);
-      }
+        return equalJumpTables(*JumpTableA, *JumpTableB, A, B);
+      };
 
-      if (!Identical) {
+      if(!isInstrEquivalentWith(*I, *BB, *OtherI, *OtherBB,
+                                AreSymbolsIdentical)) {
         return false;
       }
 
@@ -283,22 +284,36 @@ bool isIdenticalWith(const BinaryFunction &A, const BinaryFunction &B,
     ++BBI;
   }
 
+  // Compare exceptions action tables.
+  if (A.getLSDAActionTable() != B.getLSDAActionTable() ||
+      A.getLSDATypeTable() != B.getLSDATypeTable() ||
+      A.getLSDATypeIndexTable() != B.getLSDATypeIndexTable()) {
+    return false;
+  }
+
   return true;
 }
 
 // This hash table is used to identify identical functions. It maps
 // a function to a bucket of functions identical to it.
 struct KeyHash {
-  std::size_t operator()(const BinaryFunction *F) const {
-    return F->hash(/*Recompute=*/false);
+  size_t operator()(const BinaryFunction *F) const {
+    return F->getHash();
   }
 };
 
+/// Identify two congruent functions. Two functions are considered congruent,
+/// if they are identical/equal except for some of their instruction operands
+/// that reference potentially identical functions, i.e. functions that could
+/// be folded later. Congruent functions are candidates for folding in our
+/// iterative ICF algorithm.
+///
+/// Congruent functions are required to have identical hash.
 struct KeyCongruent {
   bool operator()(const BinaryFunction *A, const BinaryFunction *B) const {
     if (A == B)
       return true;
-    return isIdenticalWith(*A, *B, /*IgnoreSymbols=*/true, opts::UseDFS);
+    return isIdenticalWith(*A, *B, /*CongruentSymbols=*/true);
   }
 };
 
@@ -306,7 +321,7 @@ struct KeyEqual {
   bool operator()(const BinaryFunction *A, const BinaryFunction *B) const {
     if (A == B)
       return true;
-    return isIdenticalWith(*A, *B, /*IgnoreSymbols=*/false, opts::UseDFS);
+    return isIdenticalWith(*A, *B, /*CongruentSymbols=*/false);
   }
 };
 
@@ -317,6 +332,74 @@ typedef std::unordered_map<BinaryFunction *, std::set<BinaryFunction *>,
 typedef std::unordered_map<BinaryFunction *, std::vector<BinaryFunction *>,
                            KeyHash, KeyEqual>
     IdenticalBucketsMap;
+
+std::string hashInteger(uint64_t Value) {
+  std::string HashString;
+  if (Value == 0) {
+    HashString.push_back(0);
+  }
+  while (Value) {
+    uint8_t LSB = Value & 0xff;
+    HashString.push_back(LSB);
+    Value >>= 8;
+  }
+
+  return HashString;
+}
+
+std::string hashSymbol(BinaryContext &BC, const MCSymbol &Symbol) {
+  std::string HashString;
+
+  // Ignore function references.
+  if (BC.getFunctionForSymbol(&Symbol))
+    return HashString;
+
+  auto ErrorOrValue = BC.getSymbolValue(Symbol);
+  if (!ErrorOrValue)
+    return HashString;
+
+  // Ignore jump table references.
+  if (BC.getJumpTableContainingAddress(*ErrorOrValue))
+    return HashString;
+
+  return HashString.append(hashInteger(*ErrorOrValue));
+}
+
+std::string hashExpr(BinaryContext &BC, const MCExpr &Expr) {
+  switch (Expr.getKind()) {
+  case MCExpr::Constant:
+    return hashInteger(cast<MCConstantExpr>(Expr).getValue());
+  case MCExpr::SymbolRef:
+    return hashSymbol(BC, cast<MCSymbolRefExpr>(Expr).getSymbol());
+  case MCExpr::Unary: {
+    const auto &UnaryExpr = cast<MCUnaryExpr>(Expr);
+    return hashInteger(UnaryExpr.getOpcode())
+        .append(hashExpr(BC, *UnaryExpr.getSubExpr()));
+  }
+  case MCExpr::Binary: {
+    const auto &BinaryExpr = cast<MCBinaryExpr>(Expr);
+    return hashExpr(BC, *BinaryExpr.getLHS())
+        .append(hashInteger(BinaryExpr.getOpcode()))
+        .append(hashExpr(BC, *BinaryExpr.getRHS()));
+  }
+  case MCExpr::Target:
+    return std::string();
+  }
+
+  llvm_unreachable("invalid expression kind");
+}
+
+std::string hashInstOperand(BinaryContext &BC, const MCOperand &Operand) {
+  if (Operand.isImm()) {
+    return hashInteger(Operand.getImm());
+  } else if (Operand.isReg()) {
+    return hashInteger(Operand.getReg());
+  } else if (Operand.isExpr()) {
+    return hashExpr(BC, *Operand.getExpr());
+  }
+
+  return std::string();
+}
 
 } // namespace
 
@@ -341,7 +424,11 @@ void IdenticalCodeFolding::runOnFunctions(BinaryContext &BC) {
       BF.updateLayoutIndices();
 
       // Pre-compute hash before pushing into hashtable.
-      BF.hash(/*Recompute=*/true, opts::UseDFS);
+      // Hash instruction operands to minimize hash collisions.
+      BF.computeHash(opts::UseDFS,
+                     [&BC] (const MCOperand &Op) {
+                       return hashInstOperand(BC, Op);
+                     });
     };
 
     ParallelUtilities::PredicateTy SkipFunc = [&](const BinaryFunction &BF) {
@@ -381,7 +468,7 @@ void IdenticalCodeFolding::runOnFunctions(BinaryContext &BC) {
       ThPool = &ParallelUtilities::getThreadPool();
 
     // Fold identical functions within a single congruent bucket
-    auto procesSingleBucket = [&](std::set<BinaryFunction *> &Candidates) {
+    auto processSingleBucket = [&](std::set<BinaryFunction *> &Candidates) {
       Timer T("folding single congruent list", "folding single congruent list");
       DEBUG(T.startTimer());
 
@@ -440,9 +527,9 @@ void IdenticalCodeFolding::runOnFunctions(BinaryContext &BC) {
         continue;
 
       if (opts::NoThreads)
-        procesSingleBucket(Bucket);
+        processSingleBucket(Bucket);
       else
-        ThPool->async(procesSingleBucket, std::ref(Bucket));
+        ThPool->async(processSingleBucket, std::ref(Bucket));
     }
 
     if (!opts::NoThreads)

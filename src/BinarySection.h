@@ -46,7 +46,6 @@ class BinarySection {
   unsigned Alignment;         // alignment in bytes (must be > 0)
   unsigned ELFType;           // ELF section type
   unsigned ELFFlags;          // ELF section flags
-  bool IsLocal;               // Is this a local section?
 
   // Relocations associated with this section.  Relocation offsets are
   // wrt. to the original section address and size.
@@ -54,7 +53,7 @@ class BinarySection {
   RelocationSetType Relocations;
 
   // Pending relocations for this section.  For the moment, just used by
-  // the .debug_info section.  TODO: it would be nice to get rid of this.
+  // the .debug_info section.
   RelocationSetType PendingRelocations;
 
   // Output info
@@ -89,12 +88,13 @@ class BinarySection {
   }
   static StringRef getContents(SectionRef Section) {
     StringRef Contents;
-    if (ELFSectionRef(Section).getType() != ELF::SHT_NOBITS) {
-      if (auto EC = Section.getContents(Contents)) {
-        errs() << "BOLT-ERROR: cannot get section contents for "
-               << getName(Section) << ": " << EC.message() << ".\n";
-        exit(1);
-      }
+    if (Section.getObject()->isELF() && ELFSectionRef(Section).getType() == ELF::SHT_NOBITS)
+      return Contents;
+
+    if (auto EC = Section.getContents(Contents)) {
+      errs() << "BOLT-ERROR: cannot get section contents for "
+             << getName(Section) << ": " << EC.message() << ".\n";
+      exit(1);
     }
     return Contents;
   }
@@ -109,13 +109,11 @@ class BinarySection {
               uint64_t NewSize,
               unsigned NewAlignment,
               unsigned NewELFType,
-              unsigned NewELFFlags,
-              bool NewIsLocal) {
+              unsigned NewELFFlags) {
     assert(NewAlignment > 0 && "section alignment must be > 0");
     Alignment = NewAlignment;
     ELFType = NewELFType;
     ELFFlags = NewELFFlags;
-    IsLocal = NewIsLocal || StringRef(Name).startswith(".local.");
     OutputSize = NewSize;
     OutputContents = StringRef(reinterpret_cast<const char*>(NewData),
                                NewData ? NewSize : 0);
@@ -125,8 +123,7 @@ public:
   /// Copy a section.
   explicit BinarySection(BinaryContext &BC,
                          StringRef Name,
-                         const BinarySection &Section,
-                         bool IsLocal = false)
+                         const BinarySection &Section)
     : BC(BC),
       Name(Name),
       Section(Section.getSectionRef()),
@@ -136,15 +133,13 @@ public:
       Alignment(Section.getAlignment()),
       ELFType(Section.getELFType()),
       ELFFlags(Section.getELFFlags()),
-      IsLocal(IsLocal || StringRef(Name).startswith(".local.")),
       Relocations(Section.Relocations),
       PendingRelocations(Section.PendingRelocations),
       OutputName(Name) {
   }
 
   BinarySection(BinaryContext &BC,
-                SectionRef Section,
-                bool IsLocal = false)
+                SectionRef Section)
     : BC(BC),
       Name(getName(Section)),
       Section(Section),
@@ -152,10 +147,11 @@ public:
       Address(Section.getAddress()),
       Size(Section.getSize()),
       Alignment(Section.getAlignment()),
-      ELFType(ELFSectionRef(Section).getType()),
-      ELFFlags(ELFSectionRef(Section).getFlags()),
-      IsLocal(IsLocal || StringRef(Name).startswith(".local.")),
       OutputName(Name) {
+    if (Section.getObject()->isELF()) {
+      ELFType = ELFSectionRef(Section).getType();
+      ELFFlags = ELFSectionRef(Section).getFlags();
+    }
   }
 
   // TODO: pass Data as StringRef/ArrayRef? use StringRef::copy method.
@@ -165,8 +161,7 @@ public:
                 uint64_t Size,
                 unsigned Alignment,
                 unsigned ELFType,
-                unsigned ELFFlags,
-                bool IsLocal)
+                unsigned ELFFlags)
     : BC(BC),
       Name(Name),
       Contents(reinterpret_cast<const char*>(Data), Data ? Size : 0),
@@ -175,7 +170,6 @@ public:
       Alignment(Alignment),
       ELFType(ELFType),
       ELFFlags(ELFFlags),
-      IsLocal(IsLocal || Name.startswith(".local.")),
       IsFinalized(true),
       OutputName(Name),
       OutputSize(Size),
@@ -210,8 +204,7 @@ public:
             getData() == Other.getData() &&
             Alignment == Other.Alignment &&
             ELFType == Other.ELFType &&
-            ELFFlags == Other.ELFFlags &&
-            IsLocal == Other.IsLocal);
+            ELFFlags == Other.ELFFlags);
   }
 
   bool operator!=(const BinarySection &Other) const {
@@ -230,17 +223,22 @@ public:
   ///
   /// Basic proprety access.
   ///
+  bool isELF() const;
   StringRef getName() const { return Name; }
   uint64_t getAddress() const { return Address; }
   uint64_t getEndAddress() const { return Address + Size; }
   uint64_t getSize() const { return Size; }
   uint64_t getAlignment() const { return Alignment; }
   bool isText() const {
-    return (ELFFlags & ELF::SHF_EXECINSTR);
+    if (isELF())
+      return (ELFFlags & ELF::SHF_EXECINSTR);
+    return getSectionRef().isText();
   }
   bool isData() const {
-    return (ELFType == ELF::SHT_PROGBITS &&
-            (ELFFlags & (ELF::SHF_ALLOC | ELF::SHF_WRITE)));
+    if (isELF())
+      return (ELFType == ELF::SHT_PROGBITS &&
+              (ELFFlags & (ELF::SHF_ALLOC | ELF::SHF_WRITE)));
+    return getSectionRef().isData();
   }
   bool isBSS() const {
     return (ELFType == ELF::SHT_NOBITS &&
@@ -252,9 +250,6 @@ public:
   bool isTBSS() const {
     return isBSS() && isTLS();
   }
-  bool isNote() const { return ELFType == ELF::SHT_NOTE; }
-  bool isStrTab() const { return ELFType == ELF::SHT_STRTAB; }
-  bool isSymTab() const { return ELFType == ELF::SHT_SYMTAB; }
   bool isVirtual() const { return ELFType == ELF::SHT_NOBITS; }
   bool isRela() const { return ELFType == ELF::SHT_RELA; }
   bool isReadOnly() const {
@@ -265,7 +260,6 @@ public:
   bool isAllocatable() const {
     return (ELFFlags & ELF::SHF_ALLOC) && !isTBSS();
   }
-  bool isLocal() const { return IsLocal; }
   bool isReordered() const { return IsReordered; }
   bool isAnonymous() const { return IsAnonymous; }
   unsigned getELFType() const { return ELFType; }
@@ -342,7 +336,8 @@ public:
     if (!Pending) {
       Relocations.emplace(Relocation{Offset, Symbol, Type, Addend, Value});
     } else {
-      PendingRelocations.emplace(Relocation{Offset, Symbol, Type, Addend, Value});
+      PendingRelocations.emplace(
+          Relocation{Offset, Symbol, Type, Addend, Value});
     }
   }
 
@@ -410,6 +405,13 @@ public:
     IsAnonymous = Flag;
   }
 
+  /// Emit the section as data, possibly with relocations. Use name \p NewName
+  //  for the section during emission if non-empty.
+  void emitAsData(MCStreamer &Streamer, StringRef NewName = StringRef()) const;
+
+  /// Flush all pending relocations to the emitted section.
+  void flushPendingRelocations(raw_pwrite_stream &OS);
+
   /// Reorder the contents of this section according to /p Order.  If
   /// /p Inplace is true, the entire contents of the section is reordered,
   /// otherwise the new contents contain only the reordered data.
@@ -461,9 +463,6 @@ struct SDTMarkerInfo {
 
   /// The offset of PC within the note section
   unsigned PCOffset;
-
-  /// A label that marks the location of the SDT nop instruction
-  MCSymbol *Label;
 };
 
 } // namespace bolt

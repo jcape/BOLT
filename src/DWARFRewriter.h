@@ -16,6 +16,7 @@
 #include "RewriteInstance.h"
 #include <map>
 #include <mutex>
+#include <vector>
 
 namespace llvm {
 
@@ -40,16 +41,34 @@ class DWARFRewriter {
 
   std::mutex AbbrevPatcherMutex;
 
-  /// Stores and serializes information that will be put into the .debug_ranges
-  /// and .debug_aranges DWARF sections.
-  std::unique_ptr<DebugRangesSectionsWriter> RangesSectionsWriter;
+  /// Stores and serializes information that will be put into the
+  /// .debug_ranges DWARF section.
+  std::unique_ptr<DebugRangesSectionWriter> RangesSectionWriter;
 
-  std::unique_ptr<DebugLocWriter> LocationListWriter;
+  /// Stores and serializes information that will be put into the
+  /// .debug_aranges DWARF section.
+  std::unique_ptr<DebugARangesSectionWriter> ARangesSectionWriter;
+
+  /// Use a separate location list writer for each compilation unit
+  std::vector<std::unique_ptr<DebugLocWriter>> LocListWritersByCU;
+
+  struct LocListDebugInfoPatchType {
+    uint32_t DebugInfoOffset;
+    size_t CUIndex;
+    uint64_t CUWriterOffset;
+  };
+
+  /// The list of debug info patches to be made once individual
+  /// location list writers have been filled
+  std::vector<LocListDebugInfoPatchType> LocListDebugInfoPatches;
+
+  std::mutex LocListDebugInfoPatchesMutex;
 
   /// Recursively update debug info for all DIEs in \p Unit.
   /// If \p Function is not empty, it points to a function corresponding
   /// to a parent DW_TAG_subprogram node of the current \p DIE.
   void updateUnitDebugInfo(
+      size_t CUIndex,
       const DWARFDie DIE, std::vector<const BinaryFunction *> FunctionStack,
       const BinaryFunction *&CachedFunction,
       std::map<DebugAddressRangesVector, uint64_t> &CachedRanges);
@@ -63,6 +82,8 @@ class DWARFRewriter {
   /// \p DIE is the object's DIE in the input binary.
   void updateDWARFObjectAddressRanges(const DWARFDie DIE,
                                       uint64_t DebugRangesOffset);
+
+  std::unique_ptr<LocBufferVector> makeFinalLocListsSection();
 
   /// Generate new contents for .debug_ranges and .debug_aranges section.
   void finalizeDebugSections();
@@ -113,10 +134,6 @@ public:
   /// Computes output .debug_line line table offsets for each compile unit,
   /// and updates stmt_list for a corresponding compile unit.
   void updateLineTableOffsets();
-
-  /// Updates debug line information for non-simple functions, which are not
-  /// rewritten.
-  void updateDebugLineInfoForNonSimpleFunctions();
 };
 
 } // namespace bolt

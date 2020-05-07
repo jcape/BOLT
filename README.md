@@ -57,7 +57,7 @@ use version 4.9 or later):
 > cd ..
 > mkdir build
 > cd build
-> cmake -G Ninja ../llvm -DLLVM_TARGETS_TO_BUILD="X86;AArch64" -DCMAKE_BUILD_TYPE=Release
+> cmake -G Ninja ../llvm -DLLVM_TARGETS_TO_BUILD="X86;AArch64" -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON
 > ninja
 ```
 
@@ -66,6 +66,22 @@ ensure the rest of the commands in this tutorial work.
 
 Note that we use a specific revision of LLVM as we currently rely on a set of
 patches that are not yet upstreamed.
+
+## Optimizing BOLT's Performance
+
+BOLT runs many internal passes in parallel. If you foresee heavy usage of
+BOLT, you can improve the processing time by linking against one of memory
+allocation libraries with good support for concurrency. E.g. to use jemalloc:
+
+```
+> sudo yum install jemalloc-devel
+> LD_PRELOAD=/usr/lib64/libjemalloc.so llvm-bolt ....
+```
+Or if you rather use tcmalloc:
+```
+> sudo yum install gperftools-devel
+> LD_PRELOAD=/usr/lib64/libtcmalloc_minimal.so llvm-bolt ....
+```
 
 ## Usage
 
@@ -149,7 +165,7 @@ Once you have `perf.fdata` ready, you can use it for optimizations with
 BOLT. Assuming your environment is setup to include the right path, execute
 `llvm-bolt`:
 ```
-$ llvm-bolt <executable> -o <executable>.bolt -data=perf.fdata -reorder-blocks=cache+ -reorder-functions=hfsort+ -split-functions=3 -split-all-cold -split-eh -dyno-stats
+$ llvm-bolt <executable> -o <executable>.bolt -data=perf.fdata -reorder-blocks=cache+ -reorder-functions=hfsort -split-functions=2 -split-all-cold -split-eh -dyno-stats
 ```
 
 If you do need an updated debug info, then add `-update-debug-sections` option

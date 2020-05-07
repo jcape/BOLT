@@ -21,7 +21,9 @@
 #include "MCPlusBuilder.h"
 #include "llvm/ADT/iterator.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Triple.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/DebugInfo/DWARF/DWARFCompileUnit.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/MC/MCAsmBackend.h"
@@ -62,6 +64,7 @@ namespace bolt {
 class BinaryFunction;
 class BinaryBasicBlock;
 class DataReader;
+class ExecutableFileMemoryManager;
 
 enum class MemoryContentsType : char {
   UNKNOWN = 0,              /// Unknown contents.
@@ -167,14 +170,21 @@ class BinaryContext {
   /// Jump tables for all functions mapped by address.
   std::map<uint64_t, JumpTable *> JumpTables;
 
+  /// Locations of PC-relative relocations in data objects.
+  std::unordered_set<uint64_t> DataPCRelocations;
+
   /// Used in duplicateJumpTable() to uniquely identify a JT clone
   /// Start our IDs with a high number so getJumpTableContainingAddress checks
   /// with size won't overflow
   uint32_t DuplicatedJumpTables{0x10000000};
 
 public:
+  static std::unique_ptr<BinaryContext>
+  createBinaryContext(ObjectFile *File, DataReader &DR,
+                      std::unique_ptr<DWARFContext> DwCtx);
+
   /// [name] -> [BinaryData*] map used for global symbol resolution.
-  using SymbolMapType = std::map<std::string, BinaryData *>;
+  using SymbolMapType = StringMap<BinaryData *>;
   SymbolMapType GlobalSymbols;
 
   /// [address] -> [BinaryData], ...
@@ -191,6 +201,10 @@ public:
   using FilteredBinaryDataConstIterator =
     FilterIterator<binary_data_const_iterator>;
   using FilteredBinaryDataIterator = FilterIterator<binary_data_iterator>;
+
+  /// Memory manager for sections and segments. Used to communicate with ORC
+  /// among other things.
+  std::shared_ptr<ExecutableFileMemoryManager> EFMM;
 
   /// Return BinaryFunction containing a given \p Address or nullptr if
   /// no registered function has it.
@@ -244,6 +258,24 @@ public:
     return nullptr;
   }
 
+  unsigned getDWARFEncodingSize(unsigned Encoding) {
+    switch (Encoding & 0x0f) {
+    default: llvm_unreachable("unknown encoding");
+    case dwarf::DW_EH_PE_absptr:
+    case dwarf::DW_EH_PE_signed:
+      return AsmInfo->getCodePointerSize();
+    case dwarf::DW_EH_PE_udata2:
+    case dwarf::DW_EH_PE_sdata2:
+      return 2;
+    case dwarf::DW_EH_PE_udata4:
+    case dwarf::DW_EH_PE_sdata4:
+      return 4;
+    case dwarf::DW_EH_PE_udata8:
+    case dwarf::DW_EH_PE_sdata8:
+      return 8;
+    }
+  }
+
   /// [MCSymbol] -> [BinaryFunction]
   ///
   /// As we fold identical functions, multiple symbols can point
@@ -257,9 +289,7 @@ public:
   /// Look up the symbol entry that contains the given \p Address (based on
   /// the start address and size for each symbol).  Returns a pointer to
   /// the BinaryData for that symbol.  If no data is found, nullptr is returned.
-  const BinaryData *getBinaryDataContainingAddressImpl(uint64_t Address,
-                                                       bool IncludeEnd,
-                                                       bool BestFit) const;
+  const BinaryData *getBinaryDataContainingAddressImpl(uint64_t Address) const;
 
   /// Update the Parent fields in BinaryDatas after adding a new entry into
   /// \p BinaryDataMap.
@@ -390,6 +420,9 @@ public:
 
   /// A mutex that is used to control parallel accesses to Ctx
   mutable std::shared_timed_mutex CtxMutex;
+  std::unique_lock<std::shared_timed_mutex> scopeLock() const {
+    return std::unique_lock<std::shared_timed_mutex>(CtxMutex);
+  }
 
   std::unique_ptr<DWARFContext> DwCtx;
 
@@ -454,6 +487,14 @@ public:
   uint64_t OldTextSectionAddress{0};
   uint64_t OldTextSectionOffset{0};
   uint64_t OldTextSectionSize{0};
+
+  /// Address of the code/function that is executed before any other code in
+  /// the binary.
+  Optional<uint64_t> StartFunctionAddress;
+
+  /// Address of the code/function that is going to be executed right before
+  /// the execution of the binary is completed.
+  Optional<uint64_t> FiniFunctionAddress;
 
   /// Page alignment used for code layout.
   uint64_t PageAlign{HugePageSize};
@@ -580,13 +621,9 @@ public:
                                     uint16_t Alignment = 0,
                                     unsigned Flags = 0);
 
-  /// Register a symbol with \p Name at a given \p Address and \p Size.
-  MCSymbol *registerNameAtAddress(StringRef Name,
-                                  uint64_t Address,
-                                  BinaryData* BD);
-
-  /// Register a symbol with \p Name at a given \p Address, \p Size and
-  /// /p Flags.  See llvm::SymbolRef::Flags for definition of /p Flags.
+  /// Register a symbol with \p Name at a given \p Address using \p Size,
+  /// \p Alignment, and \p Flags. See llvm::SymbolRef::Flags for the definition
+  /// of \p Flags.
   MCSymbol *registerNameAtAddress(StringRef Name,
                                   uint64_t Address,
                                   uint64_t Size,
@@ -608,18 +645,14 @@ public:
   /// Look up the symbol entry that contains the given \p Address (based on
   /// the start address and size for each symbol).  Returns a pointer to
   /// the BinaryData for that symbol.  If no data is found, nullptr is returned.
-  const BinaryData *getBinaryDataContainingAddress(uint64_t Address,
-                                                   bool IncludeEnd = false,
-                                                   bool BestFit = false) const {
-    return getBinaryDataContainingAddressImpl(Address, IncludeEnd, BestFit);
+  const BinaryData *
+  getBinaryDataContainingAddress(uint64_t Address) const {
+    return getBinaryDataContainingAddressImpl(Address);
   }
 
-  BinaryData *getBinaryDataContainingAddress(uint64_t Address,
-                                             bool IncludeEnd = false,
-                                             bool BestFit = false) {
-    return const_cast<BinaryData *>(getBinaryDataContainingAddressImpl(Address,
-                                                                       IncludeEnd,
-                                                                       BestFit));
+  BinaryData *getBinaryDataContainingAddress(uint64_t Address) {
+    return
+      const_cast<BinaryData *>(getBinaryDataContainingAddressImpl(Address));
   }
 
   /// Return BinaryData for the given \p Name or nullptr if no
@@ -659,6 +692,11 @@ public:
     return Ctx->getELFSection(SectionName,
                               ELF::SHT_PROGBITS,
                               ELF::SHF_EXECINSTR | ELF::SHF_ALLOC);
+  }
+
+  /// Return data section with a given name.
+  MCSection *getDataSection(StringRef SectionName) const {
+    return Ctx->getELFSection(SectionName, ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
   }
 
   /// \name Pre-assigned Section Names
@@ -707,10 +745,6 @@ public:
   /// Print the global symbol table.
   void printGlobalSymbols(raw_ostream& OS) const;
 
-  /// Get the raw bytes for a given function.
-  ErrorOr<ArrayRef<uint8_t>>
-  getFunctionData(const BinaryFunction &Function) const;
-
   /// Register information about the given \p Section so we can look up
   /// sections by address.
   BinarySection &registerSection(SectionRef Section);
@@ -727,22 +761,21 @@ public:
                                          unsigned ELFFlags,
                                          uint8_t *Data = nullptr,
                                          uint64_t Size = 0,
-                                         unsigned Alignment = 1,
-                                         bool IsLocal = false);
+                                         unsigned Alignment = 1);
 
   /// Register the information for the note (non-allocatable) section
   /// with the given /p Name.  If the section already exists, the
   /// information in the section will be updated with the new data.
-  BinarySection &registerOrUpdateNoteSection(StringRef Name,
-                                             uint8_t *Data = nullptr,
-                                             uint64_t Size = 0,
-                                             unsigned Alignment = 1,
-                                             bool IsReadOnly = true,
-                                             unsigned ELFType = ELF::SHT_PROGBITS,
-                                             bool IsLocal = false) {
+  BinarySection &
+  registerOrUpdateNoteSection(StringRef Name,
+                              uint8_t *Data = nullptr,
+                              uint64_t Size = 0,
+                              unsigned Alignment = 1,
+                              bool IsReadOnly = true,
+                              unsigned ELFType = ELF::SHT_PROGBITS) {
     return registerOrUpdateSection(Name, ELFType,
                                    BinarySection::getFlags(IsReadOnly),
-                                   Data, Size, Alignment, IsLocal);
+                                   Data, Size, Alignment);
   }
 
   /// Remove the given /p Section from the set of all sections.  Return
@@ -893,12 +926,9 @@ public:
   void addRelocation(uint64_t Address, MCSymbol *Symbol, uint64_t Type,
                      uint64_t Addend = 0, uint64_t Value = 0);
 
-  /// All PC-relative relocations in data objects.
-  std::map<uint64_t, std::pair<uint64_t, uint64_t>> PCRelocation;
-
-  void addPCRelativeDataRelocation(uint64_t Address, uint64_t Type,
-                                   uint64_t Value) {
-    PCRelocation[Address] = std::make_pair(Type, Value);
+  /// Register a presence of PC-relative relocation at the given \p Address.
+  void addPCRelativeDataRelocation(uint64_t Address) {
+    DataPCRelocations.emplace(Address);
   }
 
   /// Remove registered relocation at a given \p Address.
@@ -908,17 +938,21 @@ public:
   /// is no relocation at such address.
   const Relocation *getRelocationAt(uint64_t Address);
 
-  /// This function is thread safe.
-  const BinaryFunction *getFunctionForSymbol(const MCSymbol *Symbol) const {
-    std::shared_lock<std::shared_timed_mutex> Lock(SymbolToFunctionMapMutex);
-    auto BFI = SymbolToFunctionMap.find(Symbol);
-    return BFI == SymbolToFunctionMap.end() ? nullptr : BFI->second;
-  }
+  /// This function makes sure that symbols referenced by ambiguous relocations
+  /// are marked as immovable. For now, if a section relocation points at the
+  /// boundary between two symbols then those symbols are marked as immovable.
+  void markAmbiguousRelocations(BinaryData &BD, const uint64_t Address);
 
-  BinaryFunction *getFunctionForSymbol(const MCSymbol *Symbol) {
-    std::shared_lock<std::shared_timed_mutex> Lock(SymbolToFunctionMapMutex);
-    auto BFI = SymbolToFunctionMap.find(Symbol);
-    return BFI == SymbolToFunctionMap.end() ? nullptr : BFI->second;
+  /// Return BinaryFunction corresponding to \p Symbol. If \p EntryDesc is not
+  /// nullptr, set it to entry descriminator corresponding to \p Symbol
+  /// (0 for single-entry functions). This function is thread safe.
+  BinaryFunction *getFunctionForSymbol(const MCSymbol *Symbol,
+                                       uint64_t *EntryDesc = nullptr);
+
+  const BinaryFunction *getFunctionForSymbol(
+      const MCSymbol *Symbol, uint64_t *EntryDesc = nullptr) const {
+    return const_cast<BinaryContext *>(this)->
+        getFunctionForSymbol(Symbol, EntryDesc);
   }
 
   /// Associate the symbol \p Sym with the function \p BF for lookups with
@@ -939,11 +973,14 @@ public:
   std::vector<BinaryFunction *> getSortedFunctions();
 
   /// Do the best effort to calculate the size of the function by emitting
-  /// its code, and relaxing branch instructions.
+  /// its code, and relaxing branch instructions. By default, branch
+  /// instructions are updated to match the layout. Pass \p FixBranches set to
+  /// false if the branches are known to be up to date with the code layout.
   ///
   /// Return the pair where the first size is for the main part, and the second
   /// size is for the cold one.
-  std::pair<size_t, size_t> calculateEmittedSize(BinaryFunction &BF);
+  std::pair<size_t, size_t>
+  calculateEmittedSize(BinaryFunction &BF, bool FixBranches = true);
 
   /// Calculate the size of the instruction \p Inst optionally using a
   /// user-supplied emitter for lock-free multi-thread work. MCCodeEmitter is
@@ -976,6 +1013,11 @@ public:
     }
     return Size;
   }
+
+  /// Verify that assembling instruction \p Inst results in the same sequence of
+  /// bytes as \p Encoding.
+  bool validateEncoding(const MCInst &Instruction,
+                        ArrayRef<uint8_t> Encoding) const;
 
   /// Return a function execution count threshold for determining whether
   /// the function is 'hot'. Consider it hot if count is above the average exec

@@ -25,7 +25,6 @@ namespace opts {
 extern cl::OptionCategory BoltOptCategory;
 
 extern cl::opt<unsigned> Verbosity;
-extern bool shouldProcess(const bolt::BinaryFunction &Function);
 
 cl::opt<IndirectCallPromotionType>
 IndirectCallPromotion("indirect-call-promotion",
@@ -137,8 +136,8 @@ EliminateLoads(
 static cl::opt<unsigned>
 ICPTopCallsites(
     "icp-top-callsites",
-    cl::desc("only optimize calls that contribute to this percentage of all "
-             "indirect calls. 0 = all callsites"),
+    cl::desc("optimize hottest calls until at least this percentage of all "
+             "indirect calls frequency is covered. 0 = all callsites"),
     cl::init(99),
     cl::Hidden,
     cl::ZeroOrMore,
@@ -464,7 +463,7 @@ IndirectCallPromotion::maybeGetHotJumpTableTargets(
   }
 
   if (BaseReg == BC.MRI->getProgramCounter()) {
-    auto FunctionData = BC.getFunctionData(Function);
+    auto FunctionData = Function.getData();
     const uint64_t Address = Function.getAddress() + DataOffset.get();
     MCInst OrigJmp;
     uint64_t Size;
@@ -495,7 +494,7 @@ IndirectCallPromotion::maybeGetHotJumpTableTargets(
 
     if (MI.Addr.IsSymbol) {
       // Deal with bad/stale data
-      if (!MI.Addr.Name.startswith("JUMP_TABLE/" + Function.getNames().front()))
+      if (!MI.Addr.Name.startswith("JUMP_TABLE/" + Function.getOneName().str()))
         return JumpTableInfoType();
       Index = (MI.Addr.Offset - (ArrayStart - JT->getAddress())) / JT->EntrySize;
     } else {
@@ -1227,7 +1226,7 @@ void IndirectCallPromotion::runOnFunctions(BinaryContext &BC) {
         bool DidPrintFunc = false;
         uint64_t Offset = 0;
 
-        if (!MemData || !Function.isSimple() || !opts::shouldProcess(Function))
+        if (!MemData || !Function.isSimple() || Function.isIgnored())
           continue;
 
         for (auto &BB : Function) {
@@ -1278,8 +1277,7 @@ void IndirectCallPromotion::runOnFunctions(BinaryContext &BC) {
     for (auto &BFIt : BFs) {
       auto &Function = BFIt.second;
 
-      if (!Function.isSimple() ||
-          !opts::shouldProcess(Function) ||
+      if (!Function.isSimple() || Function.isIgnored() ||
           !Function.hasProfile())
         continue;
 
@@ -1318,11 +1316,17 @@ void IndirectCallPromotion::runOnFunctions(BinaryContext &BC) {
     // number of calls.
     const float TopPerc = opts::ICPTopCallsites / 100.0f;
     int64_t MaxCalls = TotalIndirectCalls * TopPerc;
+    uint64_t LastFreq = std::numeric_limits<uint64_t>::max();
     size_t Num = 0;
     for (const auto &IC : IndirectCalls) {
-      if (MaxCalls <= 0)
+      const uint64_t CurFreq = std::get<0>(IC);
+      // Once we decide to stop, include at least all branches that share the
+      // same frequency of the last one to avoid non-deterministic behavior
+      // (e.g. turning on/off ICP depending on the order of functions)
+      if (MaxCalls <= 0 && CurFreq != LastFreq)
         break;
-      MaxCalls -= std::get<0>(IC);
+      MaxCalls -= CurFreq;
+      LastFreq = CurFreq;
       BC.MIB->addAnnotation(*std::get<1>(IC), "DoICP", true);
       Functions.insert(std::get<2>(IC));
       ++Num;
@@ -1335,9 +1339,7 @@ void IndirectCallPromotion::runOnFunctions(BinaryContext &BC) {
   for (auto *FuncPtr : Functions) {
     auto &Function = *FuncPtr;
 
-    if (!Function.isSimple() ||
-        !opts::shouldProcess(Function) ||
-        !Function.hasProfile())
+    if (!Function.isSimple() || Function.isIgnored() || !Function.hasProfile())
       continue;
 
     const bool HasLayout = !Function.layout_empty();

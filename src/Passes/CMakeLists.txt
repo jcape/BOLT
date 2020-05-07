@@ -5,9 +5,9 @@ add_llvm_library(LLVMBOLTPasses
   BinaryFunctionCallGraph.cpp
   CallGraph.cpp
   CallGraphWalker.cpp
-  CachePlusReorderAlgorithm.cpp
   DataflowAnalysis.cpp
   DataflowInfoManager.cpp
+  ExtTSPReorderAlgorithm.cpp
   FrameAnalysis.cpp
   FrameOptimizer.cpp
   HFSort.cpp
@@ -28,6 +28,7 @@ add_llvm_library(LLVMBOLTPasses
   ReorderFunctions.cpp
   ReorderData.cpp
   ShrinkWrapping.cpp
+  SplitFunctions.cpp
   StackAllocationAnalysis.cpp
   StackAvailableExpressions.cpp
   StackPointerTracking.cpp

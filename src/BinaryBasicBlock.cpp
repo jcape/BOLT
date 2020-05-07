@@ -15,6 +15,7 @@
 #include "ParallelUtilities.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCAsmLayout.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCInst.h"
 #include <limits>
@@ -30,6 +31,18 @@ constexpr uint32_t BinaryBasicBlock::INVALID_OFFSET;
 
 bool operator<(const BinaryBasicBlock &LHS, const BinaryBasicBlock &RHS) {
   return LHS.Index < RHS.Index;
+}
+
+bool BinaryBasicBlock::hasCFG() const {
+  return getParent()->hasCFG();
+}
+
+bool BinaryBasicBlock::isEntryPoint() const {
+  return getParent()->isEntryPoint(*this);
+}
+
+bool BinaryBasicBlock::hasInstructions() const {
+  return getParent()->hasInstructions();
 }
 
 void BinaryBasicBlock::adjustNumPseudos(const MCInst &Inst, int Sign) {
@@ -587,6 +600,28 @@ BinaryBasicBlock *BinaryBasicBlock::splitAt(iterator II) {
   Instructions.erase(II, end());
 
   return NewBlock;
+}
+
+void BinaryBasicBlock::updateOutputValues(const MCAsmLayout &Layout) {
+  if (!LocSyms)
+    return;
+
+  const auto BBAddress = getOutputAddressRange().first;
+  const auto BBOffset = Layout.getSymbolOffset(*getLabel());
+  for (const auto &LocSymKV : *LocSyms) {
+    const uint32_t InputFunctionOffset = LocSymKV.first;
+    const uint32_t OutputOffset = static_cast<uint32_t>(
+        Layout.getSymbolOffset(*LocSymKV.second) - BBOffset);
+    getOffsetTranslationTable().emplace_back(
+        std::make_pair(OutputOffset, InputFunctionOffset));
+
+    // Update reverse (relative to BAT) address lookup table for function.
+    if (getFunction()->hasSDTMarker()) {
+      getFunction()->getInputOffsetToAddressMap().emplace(
+          std::make_pair(InputFunctionOffset, OutputOffset + BBAddress));
+    }
+  }
+  LocSyms.reset(nullptr);
 }
 
 } // namespace bolt

@@ -1,4 +1,4 @@
-//===--- RewriteInstance.h - Interface for machine-level function ---------===//
+//===--- RewriteInstance.h - Instance of a rewriting process. -------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -16,6 +16,7 @@
 
 #include "BinaryFunction.h"
 #include "ExecutableFileMemoryManager.h"
+#include "NameResolver.h"
 #include "Passes/Instrumentation.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
@@ -38,6 +39,7 @@ class CFIReaderWriter;
 class DWARFRewriter;
 class DataAggregator;
 class DataReader;
+class NameResolver;
 class RewriteInstanceDiff;
 
 /// This class encapsulates all data necessary to carry on binary reading,
@@ -51,10 +53,6 @@ public:
                   StringRef ToolPath);
   ~RewriteInstance();
 
-  /// Reset all state except for split hints. Used to run a second pass with
-  /// function splitting information.
-  void reset();
-
   /// Run all the necessary steps to read, optimize and rewrite the binary.
   void run();
 
@@ -62,6 +60,37 @@ public:
   /// to fold identical functions.
   void compare(RewriteInstance &RI2);
 
+  /// Return binary context.
+  const BinaryContext &getBinaryContext() const {
+    return *BC;
+  }
+
+  /// Return total score of all functions for this instance.
+  uint64_t getTotalScore() const {
+    return BC->TotalScore;
+  }
+
+  /// Return the name of the input file.
+  Optional<StringRef> getInputFileName() const {
+    if (InputFile)
+      return InputFile->getFileName();
+    return NoneType();
+  }
+
+  /// Set the build-id string if we did not fail to parse the contents of the
+  /// ELF note section containing build-id information.
+  void parseBuildID();
+
+  /// The build-id is typically a stream of 20 bytes. Return these bytes in
+  /// printable hexadecimal form if they are available, or NoneType otherwise.
+  Optional<std::string> getPrintableBuildID() const;
+
+  /// Provide an access to the profile data aggregator.
+  const DataAggregator &getDataAggregator() const {
+    return DA;
+  }
+
+private:
   /// Populate array of binary functions and other objects of interest
   /// from meta data in the file.
   void discoverFileObjects();
@@ -73,8 +102,14 @@ public:
   /// Adjust supplied command-line options based on input data.
   void adjustCommandLineOptions();
 
+  /// Process input relocations.
+  void processRelocations();
+
   /// Read relocations from a given section.
   void readRelocations(const object::SectionRef &Section);
+
+  /// Mark functions that are not meant for processing as ignored.
+  void selectFunctionsToProcess();
 
   /// Read information from debug sections.
   void readDebugInfo();
@@ -103,20 +138,11 @@ public:
   /// Link additional runtime code to support instrumentation.
   void linkRuntime();
 
-  /// Emit function code.
-  void emitFunctions(MCStreamer *Streamer);
+  /// Update debug and other auxiliary information in the file.
+  void updateMetadata();
 
-  /// Emit data \p Section, possibly with relocations. Use name \p Name if
-  /// non-empty.
-  void emitDataSection(MCStreamer *Streamer,
-                       const BinarySection &Section,
-                       StringRef Name = StringRef());
-
-  /// Emit data sections that have code references in them.
-  void emitDataSections(MCStreamer *Streamer);
-
-  /// Update debug information in the file for re-written code.
-  void updateDebugInfo();
+  /// Update SDTMarkers' locations for the output binary.
+  void updateSDTMarkers();
 
   /// Return the list of code sections in the output order.
   std::vector<BinarySection *> getCodeSections();
@@ -129,13 +155,6 @@ public:
 
   /// Update output object's values based on the final \p Layout.
   void updateOutputValues(const MCAsmLayout &Layout);
-
-  /// Check which functions became larger than their original version and
-  /// annotate function splitting information.
-  ///
-  /// Returns true if any function was annotated, requiring us to perform a
-  /// second pass to emit those functions in two parts.
-  bool checkLargeFunctions();
 
   /// Rewrite back all functions (hopefully optimized) that fit in the original
   /// memory footprint for that function. If the function is now larger and does
@@ -153,11 +172,6 @@ public:
     return cantFail(OLT->findSymbol(Name, false).getAddress(),
                     "findSymbol failed");
   }
-
-private:
-  /// Emit a single function.
-  void emitFunction(MCStreamer &Streamer, BinaryFunction &Function,
-                    bool EmitColdPart);
 
   /// Detect addresses and offsets available in the binary for allocating
   /// new sections.
@@ -214,6 +228,9 @@ private:
   /// Create the regular symbol table and patch dyn symbol tables.
   ELF_FUNCTION(patchELFSymTabs);
 
+  /// Read dynamic section/segment of ELF.
+  ELF_FUNCTION(readELFDynamic);
+
   /// Patch dynamic section/segment of ELF.
   ELF_FUNCTION(patchELFDynamic);
 
@@ -238,12 +255,32 @@ private:
   std::vector<ELFShdrTy> getOutputSections(
       ELFObjectFile<ELFT> *File, std::vector<uint32_t> &NewSectionIndex);
 
+  /// Return true if \p Section should be stripped from the output binary.
+  template <typename ELFShdrTy>
+  bool shouldStrip(const ELFShdrTy &Section, StringRef SectionName);
+
+  /// Write ELF symbol table using \p Write and \p AddToStrTab functions
+  /// based on the input file symbol table passed in \p SymTabSection.
+  /// \p PatchExisting is set to true for dynamic symbol table since we
+  /// are updating it in-place with minimal modifications.
+  template <typename ELFT,
+            typename ELFShdrTy = typename ELFObjectFile<ELFT>::Elf_Shdr,
+            typename WriteFuncTy,
+            typename StrTabFuncTy>
+  void updateELFSymbolTable(
+      ELFObjectFile<ELFT> *File,
+      bool PatchExisting,
+      const ELFShdrTy &SymTabSection,
+      const std::vector<uint32_t> &NewSectionIndex,
+      WriteFuncTy Write,
+      StrTabFuncTy AddToStrTab);
+
   /// Add a notes section containing the BOLT revision and command line options.
   void addBoltInfoSection();
 
-  /// Add a notes section containing the serialized BOLT Address Translation maps
-  /// that can be used to enable sampling of the output binary for the purposes
-  /// of generating BOLT profile data for the input binary.
+  /// Add a notes section containing the serialized BOLT Address Translation
+  /// maps that can be used to enable sampling of the output binary for the
+  /// purpose of generating BOLT profile data for the input binary.
   void addBATSection();
 
   /// Loop over now emitted functions to write translation maps
@@ -320,6 +357,16 @@ private:
   static constexpr uint64_t PLTSize = 16;
   static constexpr uint16_t PLTAlignment = 16;
 
+  /// String to be added before the original section name.
+  ///
+  /// When BOLT creates a new section with the same name as the one in the
+  /// input file, it may need to preserve the original section. This prefix
+  /// will be added to the name of the original section.
+  static StringRef getOrgSecPrefix() { return ".bolt.org"; }
+
+  /// Section name used for new code.
+  static StringRef getBOLTTextSectionName() { return ".bolt.text"; }
+
   /// An instance of the input binary we are processing, externally owned.
   llvm::object::ELFObjectFileBase *InputFile;
 
@@ -333,10 +380,6 @@ private:
 
   std::unique_ptr<BinaryContext> BC;
   std::unique_ptr<CFIReaderWriter> CFIRdWrt;
-
-  /// Memory manager for sections and segments. Used to communicate with ORC
-  /// among other things.
-  std::shared_ptr<ExecutableFileMemoryManager> EFMM;
 
   std::unique_ptr<orc::SymbolStringPool> SSP;
   std::unique_ptr<orc::ExecutionSession> ES;
@@ -362,13 +405,11 @@ private:
   uint64_t NewTextSegmentSize{0};
 
   /// Extra linking
+  uint64_t InstrumentationRuntimeFiniAddress{0};
   uint64_t InstrumentationRuntimeStartAddress{0};
 
   /// Track next available address for new allocatable sections.
   uint64_t NextAvailableAddress{0};
-
-  /// Entry point in the file (first instructions to be executed).
-  uint64_t EntryPoint{0};
 
   /// Store all non-zero symbols in this map for a quick address lookup.
   std::map<uint64_t, llvm::object::SymbolRef> FileSymRefs;
@@ -409,6 +450,7 @@ private:
   ///
   /// Contains relocations against .got.plt.
   ErrorOr<BinarySection &> RelaPLTSection{std::errc::bad_address};
+  ErrorOr<BinarySection &> RelaDynSection{std::errc::bad_address};
 
   /// .note.gnu.build-id section.
   ErrorOr<BinarySection &> BuildIDSection{std::errc::bad_address};
@@ -436,47 +478,13 @@ private:
   /// A rewrite of strtab
   std::string NewStrTab;
 
-  static const std::string OrgSecPrefix;
-
-  static const std::string BOLTSecPrefix;
-
   /// Number of processed to data relocations.  Used to implement the
   /// -max-relocations debugging option.
   uint64_t NumDataRelocations{0};
 
+  NameResolver NR;
+
   friend class RewriteInstanceDiff;
-
-public:
-
-  /// Return binary context.
-  const BinaryContext &getBinaryContext() const {
-    return *BC;
-  }
-
-  /// Return total score of all functions for this instance.
-  uint64_t getTotalScore() const {
-    return BC->TotalScore;
-  }
-
-  /// Return the name of the input file.
-  Optional<StringRef> getInputFileName() const {
-    if (InputFile)
-      return InputFile->getFileName();
-    return NoneType();
-  }
-
-  /// Set the build-id string if we did not fail to parse the contents of the
-  /// ELF note section containing build-id information.
-  void parseBuildID();
-
-  /// The build-id is typically a stream of 20 bytes. Return these bytes in
-  /// printable hexadecimal form if they are available, or NoneType otherwise.
-  Optional<std::string> getPrintableBuildID() const;
-
-  /// Provide an access to the profile data aggregator.
-  const DataAggregator &getDataAggregator() const {
-    return DA;
-  }
 };
 
 } // namespace bolt

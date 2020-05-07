@@ -16,6 +16,7 @@
 #include "BinaryFunction.h"
 #include "BoltAddressTranslation.h"
 #include "DataAggregator.h"
+#include "ExecutableFileMemoryManager.h"
 #include "Heatmap.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
@@ -108,6 +109,20 @@ WriteAutoFDOData("autofdo",
   cl::desc("generate autofdo textual data instead of bolt data"),
   cl::init(false),
   cl::ZeroOrMore,
+  cl::cat(AggregatorCategory));
+
+static cl::opt<bool>
+IgnoreInterruptLBR("ignore-interrupt-lbr",
+  cl::desc("ignore kernel interrupt LBR that happens asynchronously"),
+  cl::init(true),
+  cl::ZeroOrMore,
+  cl::cat(AggregatorCategory));
+
+static cl::opt<unsigned long long>
+FilterPID("pid",
+  cl::desc("only use samples from process with specified PID"),
+  cl::init(0),
+  cl::Optional,
   cl::cat(AggregatorCategory));
 
 }
@@ -443,6 +458,30 @@ std::error_code DataAggregator::writeAutoFDOData() {
   return std::error_code();
 }
 
+void DataAggregator::filterBinaryMMapInfo() {
+  if (opts::FilterPID) {
+    auto MMapInfoIter = BinaryMMapInfo.find(opts::FilterPID);
+    if (MMapInfoIter != BinaryMMapInfo.end()) {
+      auto MMap = MMapInfoIter->second;
+      BinaryMMapInfo.clear();
+      BinaryMMapInfo.insert(std::make_pair(MMap.PID, MMap));
+    } else {
+      if (errs().has_colors())
+        errs().changeColor(raw_ostream::RED);
+      errs() << "PERF2BOLT-ERROR: could not find a profile matching PID \""
+             << opts::FilterPID << "\"" << " for binary \"" << BinaryName <<"\".";
+      assert(!BinaryMMapInfo.empty() && "No memory map for matching binary");
+      errs() << " Profile for the following process is available:\n";
+      for (auto &MMI : BinaryMMapInfo)
+        outs() << "  " << MMI.second.PID << (MMI.second.Forked ? " (forked)\n" : "\n");
+      if (errs().has_colors())
+        errs().resetColor();
+
+      exit(1);
+    }
+  }
+}
+
 void DataAggregator::parseProfile(BinaryContext &BC) {
   this->BC = &BC;
 
@@ -499,6 +538,7 @@ void DataAggregator::parseProfile(BinaryContext &BC) {
     errs() << "PERF2BOLT: failed to parse task events\n";
   }
 
+  filterBinaryMMapInfo();
   prepareToParse("events", MainEventsPPI);
 
   if (opts::HeatmapMode) {
@@ -610,7 +650,7 @@ DataAggregator::getBinaryFunctionContainingAddress(uint64_t Address) const {
 StringRef DataAggregator::getLocationName(BinaryFunction &Func,
                                           uint64_t Count) {
   if (!BAT)
-    return Func.getNames()[0];
+    return Func.getOneName();
 
   const auto *OrigFunc = &Func;
   if (const auto HotAddr = BAT->fetchParentAddress(Func.getAddress())) {
@@ -619,11 +659,9 @@ StringRef DataAggregator::getLocationName(BinaryFunction &Func,
     if (HotFunc)
       OrigFunc = HotFunc;
   }
-  const auto &Names = OrigFunc->getNames();
   // If it is a local function, prefer the name containing the file name where
   // the local function was declared
-  for (const auto &Name : Names) {
-    StringRef AlternativeName = Name;
+  for (auto AlternativeName : OrigFunc->getNames()) {
     size_t FileNameIdx = AlternativeName.find('/');
     // Confirm the alternative name has the pattern Symbol/FileName/1 before
     // using it
@@ -632,17 +670,17 @@ StringRef DataAggregator::getLocationName(BinaryFunction &Func,
       continue;
     return AlternativeName;
   }
-  return Names[0];
+  return Func.getOneName();
 }
 
 bool DataAggregator::doSample(BinaryFunction &Func, uint64_t Address,
                               uint64_t Count) {
-  auto I = FuncsToSamples.find(Func.getNames()[0]);
+  auto I = FuncsToSamples.find(Func.getOneName());
   if (I == FuncsToSamples.end()) {
     bool Success;
     StringRef LocName = getLocationName(Func, Count);
     std::tie(I, Success) = FuncsToSamples.insert(std::make_pair(
-        Func.getNames()[0],
+        Func.getOneName(),
         FuncSampleData(LocName, FuncSampleData::ContainerTy())));
   }
 
@@ -659,7 +697,7 @@ bool DataAggregator::doIntraBranch(BinaryFunction &Func, uint64_t From,
                                    uint64_t Mispreds) {
   FuncBranchData *AggrData = Func.getBranchData();
   if (!AggrData) {
-    AggrData = &FuncsToBranches[Func.getNames()[0]];
+    AggrData = &FuncsToBranches[Func.getOneName()];
     AggrData->Name = getLocationName(Func, Count);
     Func.setBranchData(AggrData);
   }
@@ -695,7 +733,7 @@ bool DataAggregator::doInterBranch(BinaryFunction *FromFunc,
     SrcFunc = getLocationName(*FromFunc, Count);
     FromAggrData = FromFunc->getBranchData();
     if (!FromAggrData) {
-      FromAggrData = &FuncsToBranches[FromFunc->getNames()[0]];
+      FromAggrData = &FuncsToBranches[FromFunc->getOneName()];
       FromAggrData->Name = SrcFunc;
       FromFunc->setBranchData(FromAggrData);
     }
@@ -709,7 +747,7 @@ bool DataAggregator::doInterBranch(BinaryFunction *FromFunc,
     DstFunc = getLocationName(*ToFunc, 0);
     ToAggrData = ToFunc->getBranchData();
     if (!ToAggrData) {
-      ToAggrData = &FuncsToBranches[ToFunc->getNames()[0]];
+      ToAggrData = &FuncsToBranches[ToFunc->getOneName()];
       ToAggrData->Name = DstFunc;
       ToFunc->setBranchData(ToAggrData);
     }
@@ -898,6 +936,8 @@ ErrorOr<DataAggregator::PerfBranchSample> DataAggregator::parseBranchSample() {
     if (std::error_code EC = LBRRes.getError())
       return EC;
     auto LBR = LBRRes.get();
+    if (ignoreKernelInterrupt(LBR))
+      continue;
     if (!BC->HasFixedLoadAddress)
       adjustLBR(LBR, MMapInfoIter->second);
     Res.LBR.push_back(LBR);
@@ -1081,6 +1121,11 @@ bool DataAggregator::hasData() {
   return true;
 }
 
+bool DataAggregator::ignoreKernelInterrupt(LBREntry &LBR) const {
+  return opts::IgnoreInterruptLBR &&
+         (LBR.From >= KernelBaseAddr || LBR.To >= KernelBaseAddr);
+}
+
 std::error_code DataAggregator::printLBRHeatMap() {
   outs() << "PERF2BOLT: parse branch events...\n";
   NamedRegionTimer T("parseBranch", "Parsing branch events", TimerGroupName,
@@ -1158,6 +1203,7 @@ std::error_code DataAggregator::parseBranchEvents() {
   uint64_t NumSamples{0};
   uint64_t NumSamplesNoLBR{0};
   uint64_t NumTraces{0};
+  bool NeedsSkylakeFix{false};
 
   while (hasData()) {
     ++NumTotalSamples;
@@ -1180,11 +1226,25 @@ std::error_code DataAggregator::parseBranchEvents() {
     }
 
     NumEntries += Sample.LBR.size();
+    if (BAT && NumEntries == 32 && !NeedsSkylakeFix) {
+      outs() << "BOLT-WARNING: Using Intel Skylake bug workaround\n";
+      NeedsSkylakeFix = true;
+    }
 
     // LBRs are stored in reverse execution order. NextPC refers to the next
     // recorded executed PC.
     uint64_t NextPC = opts::UseEventPC ? Sample.PC : 0;
+    uint32_t NumEntry{0};
     for (const auto &LBR : Sample.LBR) {
+      ++NumEntry;
+      // Hardware bug workaround: Intel Skylake (which has 32 LBR entries)
+      // sometimes record entry 32 as an exact copy of entry 31. This will cause
+      // us to likely record an invalid trace and generate a stale function for
+      // BAT mode (non BAT disassembles the function and is able to ignore this
+      // trace at aggregation time). Drop first 2 entries (last two, in
+      // chronological order)
+      if (NeedsSkylakeFix && NumEntry <= 2)
+        continue;
       if (NextPC) {
         // Record fall-through trace.
         const auto TraceFrom = LBR.To;
@@ -1457,14 +1517,14 @@ void DataAggregator::processMemEvents() {
     // Try to resolve symbol for PC
     auto *Func = getBinaryFunctionContainingAddress(PC);
     if (Func) {
-      FuncName = Func->getNames()[0];
+      FuncName = Func->getOneName();
       PC -= Func->getAddress();
     }
 
     // Try to resolve symbol for memory load
     auto *MemFunc = getBinaryFunctionContainingAddress(Addr);
     if (MemFunc) {
-      MemName = MemFunc->getNames()[0];
+      MemName = MemFunc->getOneName();
       Addr -= MemFunc->getAddress();
     } else if (Addr) {
       if (auto *BD = BC->getBinaryDataContainingAddress(Addr)) {
@@ -1734,6 +1794,14 @@ DataAggregator::parseMMapEvent() {
     return make_error_code(llvm::errc::io_error);
   }
 
+  const auto OffsetStr =
+      Line.split('@').second.ltrim().split(FieldSeparator).first;
+  if (OffsetStr.getAsInteger(0, ParsedInfo.Offset)) {
+    reportError("expected mmaped page-aligned offset");
+    Diag << "Found: " << OffsetStr << "in '" << Line << "'\n";
+    return make_error_code(llvm::errc::io_error);
+  }
+
   consumeRestOfLine();
 
   return std::make_pair(FileName, ParsedInfo);
@@ -1774,7 +1842,8 @@ std::error_code DataAggregator::parseMMapEvents() {
     for (const auto &Pair : GlobalMMapInfo) {
       dbgs() << "  " << Pair.first << " : " << Pair.second.PID << " [0x"
              << Twine::utohexstr(Pair.second.BaseAddress) << ", "
-             << Twine::utohexstr(Pair.second.Size) << "]\n";
+             << Twine::utohexstr(Pair.second.Size) << " @ "
+             << Twine::utohexstr(Pair.second.Offset) << "]\n";
     }
   );
 
@@ -1787,6 +1856,24 @@ std::error_code DataAggregator::parseMMapEvents() {
 
   auto Range = GlobalMMapInfo.equal_range(NameToUse);
   for (auto I = Range.first; I != Range.second; ++I) {
+    if (BC->HasFixedLoadAddress && I->second.BaseAddress) {
+      // Check that the binary mapping matches one of the segments.
+      bool MatchFound{false};
+      for (auto &KV : BC->EFMM->SegmentMapInfo) {
+        auto &SegInfo = KV.second;
+        const auto MapAddress = alignDown(SegInfo.Address, SegInfo.Alignment);
+        if (I->second.BaseAddress == MapAddress) {
+          MatchFound = true;
+          break;
+        }
+      }
+      if (!MatchFound) {
+        errs() << "PERF2BOLT-WARNING: ignoring mapping of " << NameToUse
+               << " at 0x" << Twine::utohexstr(I->second.BaseAddress) << '\n';
+        continue;
+      }
+    }
+
     BinaryMMapInfo.insert(std::make_pair(I->second.PID, I->second));
   }
 

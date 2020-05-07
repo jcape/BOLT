@@ -50,7 +50,7 @@ ProfileReader::buildNameMaps(std::map<uint64_t, BinaryFunction> &Functions) {
   }
   for (auto &BFI : Functions) {
     const auto &Function = BFI.second;
-    for (auto &Name : Function.getNames()) {
+    for (auto Name : Function.getNames()) {
       if (const auto CommonName = getLTOCommonName(Name)) {
         LTOCommonNameFunctionMap[*CommonName].insert(&Function);
       }
@@ -72,7 +72,7 @@ ProfileReader::parseFunctionProfile(BinaryFunction &BF,
 
   BF.setExecutionCount(YamlBF.ExecCount);
 
-  if (!opts::IgnoreHash && YamlBF.Hash != BF.hash(true, true)) {
+  if (!opts::IgnoreHash && YamlBF.Hash != BF.computeHash(/*UseDFS=*/true)) {
     if (opts::Verbosity >= 1)
       errs() << "BOLT-WARNING: function hash mismatch\n";
     ProfileMatched = false;
@@ -124,7 +124,7 @@ ProfileReader::parseFunctionProfile(BinaryFunction &BF,
       bool IsFunction = Callee ? true : false;
       const MCSymbol *CalleeSymbol = nullptr;
       if (IsFunction) {
-        CalleeSymbol = Callee->getSymbolForEntry(YamlCSI.EntryDiscriminator);
+        CalleeSymbol = Callee->getSymbolForEntryID(YamlCSI.EntryDiscriminator);
       }
       StringRef Name = CalleeSymbol ? CalleeSymbol->getName() : "<unknown>";
       BF.getAllCallSites().emplace_back(
@@ -269,7 +269,7 @@ ProfileReader::readProfile(const std::string &FileName,
     if (opts::IgnoreHash && Profile.NumBasicBlocks == BF.size())
       return true;
     if (!opts::IgnoreHash &&
-        Profile.Hash == static_cast<uint64_t>(BF.hash(/*Recompute = */false)))
+        Profile.Hash == static_cast<uint64_t>(BF.getHash()))
       return true;
     return false;
   };
@@ -282,9 +282,9 @@ ProfileReader::readProfile(const std::string &FileName,
 
     // Recompute hash once per function.
     if (!opts::IgnoreHash)
-      Function.hash(/*Recompute = */true, true);
+      Function.computeHash(/*UseDFS=*/true);
 
-    for (auto &FunctionName : Function.getNames()) {
+    for (auto FunctionName : Function.getNames()) {
       auto PI = ProfileNameToProfile.find(FunctionName);
       if (PI == ProfileNameToProfile.end()) {
         continue;
@@ -301,7 +301,7 @@ ProfileReader::readProfile(const std::string &FileName,
     if (ProfiledFunctions.count(&Function))
       continue;
 
-    for (auto &FunctionName : Function.getNames()) {
+    for (auto FunctionName : Function.getNames()) {
       const auto CommonName = getLTOCommonName(FunctionName);
       if (CommonName) {
         auto I = LTOCommonNameMap.find(*CommonName);

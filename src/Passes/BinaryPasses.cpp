@@ -9,6 +9,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "BinaryFunction.h"
 #include "BinaryPasses.h"
 #include "ParallelUtilities.h"
 #include "Passes/ReorderAlgorithm.h"
@@ -20,6 +21,7 @@
 #define DEBUG_TYPE "bolt-opts"
 
 using namespace llvm;
+using namespace bolt;
 
 namespace {
 
@@ -56,22 +58,14 @@ extern cl::OptionCategory BoltOptCategory;
 
 extern cl::opt<bolt::MacroFusionType> AlignMacroOpFusion;
 extern cl::opt<unsigned> Verbosity;
-extern cl::opt<bool> SplitEH;
 extern cl::opt<bool> EnableBAT;
-extern cl::opt<bolt::BinaryFunction::SplittingType> SplitFunctions;
-extern bool shouldProcess(const bolt::BinaryFunction &Function);
+extern cl::opt<bool> UpdateDebugSections;
 extern bool isHotTextMover(const bolt::BinaryFunction &Function);
 
 enum DynoStatsSortOrder : char {
   Ascending,
   Descending
 };
-
-static cl::opt<bool>
-AggressiveSplitting("split-all-cold",
-  cl::desc("outline as many cold basic blocks as possible"),
-  cl::ZeroOrMore,
-  cl::cat(BoltOptCategory));
 
 static cl::opt<DynoStatsSortOrder>
 DynoStatsSortOrderOpt("print-sorted-by-order",
@@ -177,8 +171,11 @@ ReorderBlocks("reorder-blocks",
       "cache",
       "perform optimal layout prioritizing I-cache "
       "behavior"),
-    clEnumValN(bolt::ReorderBasicBlocks::LT_OPTIMIZE_CACHE_PLUS,
+    clEnumValN(bolt::ReorderBasicBlocks::LT_OPTIMIZE_EXT_TSP,
       "cache+",
+      "perform layout optimizing I-cache behavior"),
+    clEnumValN(bolt::ReorderBasicBlocks::LT_OPTIMIZE_EXT_TSP,
+      "ext-tsp",
       "perform layout optimizing I-cache behavior"),
     clEnumValN(bolt::ReorderBasicBlocks::LT_OPTIMIZE_SHUFFLE,
       "cluster-shuffle",
@@ -224,25 +221,12 @@ SctcMode("sctc-mode",
   cl::cat(BoltOptCategory));
 
 static cl::opt<unsigned>
-SplitAlignThreshold("split-align-threshold",
-  cl::desc("when deciding to split a function, apply this alignment "
-           "while doing the size comparison (see -split-threshold). "
-           "Default value: 2."),
-  cl::init(2),
-  cl::ZeroOrMore,
-  cl::Hidden,
-  cl::cat(BoltOptCategory));
-
-static cl::opt<unsigned>
-SplitThreshold("split-threshold",
-  cl::desc("split function only if its main size is reduced by more than "
-           "given amount of bytes. Default value: 0, i.e. split iff the "
-           "size is reduced. Note that on some architectures the size can "
-           "increase after splitting."),
-  cl::init(0),
-  cl::ZeroOrMore,
-  cl::Hidden,
-  cl::cat(BoltOptCategory));
+StaleThreshold("stale-threshold",
+    cl::desc(
+      "maximum percentage of stale functions to tolerate (default: 100)"),
+    cl::init(100),
+    cl::Hidden,
+    cl::cat(BoltOptCategory));
 
 static cl::opt<unsigned>
 TSPThreshold("tsp-threshold",
@@ -270,12 +254,11 @@ namespace bolt {
 bool BinaryFunctionPass::shouldOptimize(const BinaryFunction &BF) const {
   return BF.isSimple() &&
          BF.getState() == BinaryFunction::State::CFG &&
-         opts::shouldProcess(BF) &&
-         (BF.getSize() > 0);
+         !BF.isIgnored();
 }
 
 bool BinaryFunctionPass::shouldPrint(const BinaryFunction &BF) const {
-  return BF.isSimple() && opts::shouldProcess(BF);
+  return BF.isSimple() && !BF.isIgnored();
 }
 
 void EliminateUnreachableBlocks::runOnFunction(BinaryFunction& Function) {
@@ -335,16 +318,10 @@ void ReorderBasicBlocks::runOnFunctions(BinaryContext &BC) {
   if (opts::ReorderBlocks == ReorderBasicBlocks::LT_NONE)
     return;
 
-  IsAArch64 = BC.isAArch64();
   std::atomic<uint64_t> ModifiedFuncCount{0};
 
   ParallelUtilities::WorkFuncTy WorkFun = [&](BinaryFunction &BF) {
-    const bool ShouldSplit =
-        (opts::SplitFunctions == BinaryFunction::ST_ALL) ||
-        (opts::SplitFunctions == BinaryFunction::ST_EH && BF.hasEHRanges()) ||
-        BF.shouldSplit();
-    modifyFunctionLayout(BF, opts::ReorderBlocks, opts::MinBranchClusters,
-                         ShouldSplit);
+    modifyFunctionLayout(BF, opts::ReorderBlocks, opts::MinBranchClusters);
     if (BF.hasLayoutChanged()) {
       ++ModifiedFuncCount;
     }
@@ -400,7 +377,7 @@ void ReorderBasicBlocks::runOnFunctions(BinaryContext &BC) {
 }
 
 void ReorderBasicBlocks::modifyFunctionLayout(BinaryFunction &BF,
-    LayoutType Type, bool MinBranchClusters, bool Split) const {
+    LayoutType Type, bool MinBranchClusters) const {
   if (BF.size() == 0 || Type == LT_NONE)
     return;
 
@@ -416,7 +393,7 @@ void ReorderBasicBlocks::modifyFunctionLayout(BinaryFunction &BF,
   } else if (BF.size() <= opts::TSPThreshold && Type != LT_OPTIMIZE_SHUFFLE) {
     // Work on optimal solution if problem is small enough
     DEBUG(dbgs() << "finding optimal block layout for " << BF << "\n");
-    Algo.reset(new OptimalReorderAlgorithm());
+    Algo.reset(new TSPReorderAlgorithm());
   } else {
     DEBUG(dbgs() << "running block layout heuristics on " << BF << "\n");
 
@@ -439,8 +416,8 @@ void ReorderBasicBlocks::modifyFunctionLayout(BinaryFunction &BF,
       Algo.reset(new OptimizeCacheReorderAlgorithm(std::move(CAlgo)));
       break;
 
-    case LT_OPTIMIZE_CACHE_PLUS:
-      Algo.reset(new CachePlusReorderAlgorithm());
+    case LT_OPTIMIZE_EXT_TSP:
+      Algo.reset(new ExtTSPReorderAlgorithm());
       break;
 
     case LT_OPTIMIZE_SHUFFLE:
@@ -455,125 +432,6 @@ void ReorderBasicBlocks::modifyFunctionLayout(BinaryFunction &BF,
   Algo->reorderBasicBlocks(BF, NewLayout);
 
   BF.updateBasicBlockLayout(NewLayout);
-
-  if (Split)
-    splitFunction(BF);
-}
-
-void ReorderBasicBlocks::splitFunction(BinaryFunction &BF) const {
-  if (!BF.size())
-    return;
-
-  bool AllCold = true;
-  for (auto *BB : BF.layout()) {
-    auto ExecCount = BB->getExecutionCount();
-    if (ExecCount == BinaryBasicBlock::COUNT_NO_PROFILE)
-      return;
-    if (ExecCount != 0)
-      AllCold = false;
-  }
-
-  if (AllCold)
-    return;
-
-  auto PreSplitLayout = BF.getLayout();
-
-  auto &BC = BF.getBinaryContext();
-  size_t OriginalHotSize;
-  size_t HotSize;
-  size_t ColdSize;
-  if (BC.isX86())
-    std::tie(OriginalHotSize, ColdSize) = BC.calculateEmittedSize(BF);
-  DEBUG(dbgs() << "Estimated size for function " << BF << " pre-split is <0x"
-               << Twine::utohexstr(OriginalHotSize) << ", 0x"
-               << Twine::utohexstr(ColdSize) << ">\n");
-
-  // Never outline the first basic block.
-  BF.layout_front()->setCanOutline(false);
-  for (auto *BB : BF.layout()) {
-    if (!BB->canOutline())
-      continue;
-    if (BB->getExecutionCount() != 0) {
-      BB->setCanOutline(false);
-      continue;
-    }
-    // Do not split extra entry points in aarch64. They can be referred by
-    // using ADRs and when this happens, these blocks cannot be placed far
-    // away due to the limited range in ADR instruction.
-    if (IsAArch64 && BB->isEntryPoint()) {
-      BB->setCanOutline(false);
-      continue;
-    }
-    if (BF.hasEHRanges() && !opts::SplitEH) {
-      // We cannot move landing pads (or rather entry points for landing
-      // pads).
-      if (BB->isLandingPad()) {
-        BB->setCanOutline(false);
-        continue;
-      }
-      // We cannot move a block that can throw since exception-handling
-      // runtime cannot deal with split functions. However, if we can guarantee
-      // that the block never throws, it is safe to move the block to
-      // decrease the size of the function.
-      for (auto &Instr : *BB) {
-        if (BF.getBinaryContext().MIB->isInvoke(Instr)) {
-          BB->setCanOutline(false);
-          break;
-        }
-      }
-    }
-  }
-
-  if (opts::AggressiveSplitting) {
-    // All blocks with 0 count that we can move go to the end of the function.
-    // Even if they were natural to cluster formation and were seen in-between
-    // hot basic blocks.
-    std::stable_sort(BF.layout_begin(), BF.layout_end(),
-        [&] (BinaryBasicBlock *A, BinaryBasicBlock *B) {
-          return A->canOutline() < B->canOutline();
-        });
-  } else if (BF.hasEHRanges() && !opts::SplitEH) {
-    // Typically functions with exception handling have landing pads at the end.
-    // We cannot move beginning of landing pads, but we can move 0-count blocks
-    // comprising landing pads to the end and thus facilitate splitting.
-    auto FirstLP = BF.layout_begin();
-    while ((*FirstLP)->isLandingPad())
-      ++FirstLP;
-
-    std::stable_sort(FirstLP, BF.layout_end(),
-        [&] (BinaryBasicBlock *A, BinaryBasicBlock *B) {
-          return A->canOutline() < B->canOutline();
-        });
-  }
-
-  // Separate hot from cold starting from the bottom.
-  for (auto I = BF.layout_rbegin(), E = BF.layout_rend();
-       I != E; ++I) {
-    BinaryBasicBlock *BB = *I;
-    if (!BB->canOutline())
-      break;
-    BB->setIsCold(true);
-  }
-
-  // Check the new size to see if it's worth splitting the function.
-  if (BC.isX86() && BF.isSplit()) {
-    std::tie(HotSize, ColdSize) = BC.calculateEmittedSize(BF);
-    DEBUG(dbgs() << "Estimated size for function " << BF << " post-split is <0x"
-                 << Twine::utohexstr(HotSize) << ", 0x"
-                 << Twine::utohexstr(ColdSize) << ">\n");
-    if (alignTo(OriginalHotSize, opts::SplitAlignThreshold) <=
-        alignTo(HotSize, opts::SplitAlignThreshold) + opts::SplitThreshold) {
-      DEBUG(dbgs() << "Reversing splitting of function " << BF << ":\n  0x"
-                   << Twine::utohexstr(HotSize) << ", 0x"
-                   << Twine::utohexstr(ColdSize) << " -> 0x"
-                   << Twine::utohexstr(OriginalHotSize) << '\n');
-
-      BF.updateBasicBlockLayout(PreSplitLayout);
-      for (auto &BB : BF) {
-        BB.setIsCold(false);
-      }
-    }
-  }
 }
 
 void FixupBranches::runOnFunctions(BinaryContext &BC) {
@@ -614,8 +472,38 @@ void FinalizeFunctions::runOnFunctions(BinaryContext &BC) {
       SkipPredicate, "FinalizeFunctions");
 }
 
+void CheckLargeFunctions::runOnFunctions(BinaryContext &BC) {
+  if (BC.HasRelocations)
+    return;
+
+  if (!opts::UpdateDebugSections)
+    return;
+
+  // If the function wouldn't fit, mark it as non-simple. Otherwise, we may emit
+  // incorrect debug info.
+  ParallelUtilities::WorkFuncTy WorkFun = [&](BinaryFunction &BF) {
+    uint64_t HotSize, ColdSize;
+    std::tie(HotSize, ColdSize) =
+        BC.calculateEmittedSize(BF, /*FixBranches=*/false);
+    if (HotSize > BF.getMaxSize())
+      BF.setSimple(false);
+  };
+
+  ParallelUtilities::PredicateTy SkipFunc = [&](const BinaryFunction &BF) {
+    return !shouldOptimize(BF);
+  };
+
+  ParallelUtilities::runOnEachFunction(
+      BC, ParallelUtilities::SchedulingPolicy::SP_INST_LINEAR, WorkFun,
+      SkipFunc, "CheckLargeFunctions");
+}
+
+bool CheckLargeFunctions::shouldOptimize(const BinaryFunction &BF) const {
+  // Unlike other passes, allow functions in non-CFG state.
+  return BF.isSimple() && !BF.isIgnored();
+}
+
 void LowerAnnotations::runOnFunctions(BinaryContext &BC) {
-  std::vector<std::pair<MCInst *, uint64_t>> PreservedSDTAnnotations;
   std::vector<std::pair<MCInst *, uint32_t>> PreservedOffsetAnnotations;
 
   for (auto &It : BC.getBinaryFunctions()) {
@@ -648,18 +536,13 @@ void LowerAnnotations::runOnFunctions(BinaryContext &BC) {
         }
       }
 
-      // Now record preserved annotations separately and then strip annotations
+      // Now record preserved annotations separately and then strip annotations.
       for (auto II = BB->begin(); II != BB->end(); ++II) {
-        if (BC.MIB->hasAnnotation(*II, "SDTMarker")) {
-          PreservedSDTAnnotations.push_back(std::make_pair(
-              &(*II), BC.MIB->getAnnotationAs<uint64_t>(*II, "SDTMarker")));
-        }
-
-        if (opts::EnableBAT && BC.MIB->hasAnnotation(*II, "Offset")) {
+        if (BF.requiresAddressTranslation() &&
+            BC.MIB->hasAnnotation(*II, "Offset")) {
           PreservedOffsetAnnotations.push_back(std::make_pair(
               &(*II), BC.MIB->getAnnotationAs<uint32_t>(*II, "Offset")));
         }
-
         BC.MIB->stripAnnotations(*II);
       }
     }
@@ -669,8 +552,6 @@ void LowerAnnotations::runOnFunctions(BinaryContext &BC) {
   BC.MIB->freeAnnotations();
 
   // Reinsert preserved annotations we need during code emission.
-  for (const auto &Item : PreservedSDTAnnotations)
-    BC.MIB->addAnnotation<uint64_t>(*Item.first, "SDTMarker", Item.second);
   for (const auto &Item : PreservedOffsetAnnotations)
     BC.MIB->addAnnotation<uint32_t>(*Item.first, "Offset", Item.second);
 }
@@ -1375,7 +1256,7 @@ void PrintProfileStats::runOnFunctions(BinaryContext &BC) {
 
 void
 PrintProgramStats::runOnFunctions(BinaryContext &BC) {
-  uint64_t NumSimpleFunctions{0};
+  uint64_t NumRegularFunctions{0};
   uint64_t NumStaleProfileFunctions{0};
   uint64_t NumNonSimpleProfiledFunctions{0};
   uint64_t NumUnknownControlFlowFunctions{0};
@@ -1383,13 +1264,20 @@ PrintProgramStats::runOnFunctions(BinaryContext &BC) {
   const char *StaleFuncsHeader = "BOLT-INFO: Functions with stale profile:\n";
   for (auto &BFI : BC.getBinaryFunctions()) {
     auto &Function = BFI.second;
+
+    // Ignore PLT functions for stats.
+    if (Function.isPLTFunction())
+      continue;
+
+    ++NumRegularFunctions;
+
     if (!Function.isSimple()) {
-      if (Function.hasProfile() && !Function.isPLTFunction()) {
+      if (Function.hasProfile()) {
         ++NumNonSimpleProfiledFunctions;
       }
       continue;
     }
-    ++NumSimpleFunctions;
+
     if (Function.hasUnknownControlFlow()) {
       if (opts::PrintUnknownCFG) {
         Function.dump();
@@ -1398,8 +1286,10 @@ PrintProgramStats::runOnFunctions(BinaryContext &BC) {
       }
       ++NumUnknownControlFlowFunctions;
     }
+
     if (!Function.hasProfile())
       continue;
+
     if (Function.hasValidProfile()) {
       ProfiledFunctions.push_back(&Function);
     } else {
@@ -1415,24 +1305,34 @@ PrintProgramStats::runOnFunctions(BinaryContext &BC) {
 
   const auto NumAllProfiledFunctions =
                             ProfiledFunctions.size() + NumStaleProfileFunctions;
-  outs() << "BOLT-INFO: "
-         << NumAllProfiledFunctions
-         << " functions out of " << NumSimpleFunctions << " simple functions ("
+  outs() << "BOLT-INFO: " << NumAllProfiledFunctions
+         << " out of " << NumRegularFunctions << " functions in the binary ("
          << format("%.1f", NumAllProfiledFunctions /
-                                            (float) NumSimpleFunctions * 100.0f)
-         << "%) have non-empty execution profile.\n";
+                             (float) NumRegularFunctions * 100.0f)
+         << "%) have non-empty execution profile\n";
   if (NumNonSimpleProfiledFunctions) {
     outs() << "BOLT-INFO: " << NumNonSimpleProfiledFunctions
-           << " non-simple function(s) have profile.\n";
+           << " function" << (NumNonSimpleProfiledFunctions == 1 ? "" : "s")
+           << " with profile could not be optimized\n";
   }
   if (NumStaleProfileFunctions) {
-    outs() << "BOLT-INFO: " << NumStaleProfileFunctions
-           << format(" (%.1f%% of all profiled)",
-                     NumStaleProfileFunctions /
-                                      (float) NumAllProfiledFunctions * 100.0f)
+    const float PctStale =
+      NumStaleProfileFunctions / (float) NumAllProfiledFunctions * 100.0f;
+    if (PctStale > opts::StaleThreshold) {
+      errs() << "BOLT-ERROR: ";
+    } else {
+      errs() << "BOLT-WARNING: ";
+    }
+    errs() << NumStaleProfileFunctions
+           << format(" (%.1f%% of all profiled)", PctStale)
            << " function" << (NumStaleProfileFunctions == 1 ? "" : "s")
            << " have invalid (possibly stale) profile."
               " Use -report-stale to see the list.\n";
+    if (PctStale > opts::StaleThreshold) {
+      errs() << "BOLT-ERROR: stale functions exceed specified threshold of "
+             << opts::StaleThreshold << "%. Exiting.\n";
+      exit(1);
+    }
   }
 
   // Profile is marked as 'Used' if it either matches a function name
@@ -1559,13 +1459,15 @@ PrintProgramStats::runOnFunctions(BinaryContext &BC) {
 
   if (!BC.TrappedFunctions.empty()) {
     errs() << "BOLT-WARNING: " << BC.TrappedFunctions.size()
-           << " functions will trap on entry";
-    if (opts::Verbosity >= 1) {
-      errs() << ".\n";
+           << " function" << (BC.TrappedFunctions.size() > 1 ? "s" : "")
+           << " will trap on entry. Use -trap-avx512=0 to disable"
+              " traps.";
+    if (opts::Verbosity >= 1 || BC.TrappedFunctions.size() <= 5) {
+      errs() << '\n';
       for (const auto *Function : BC.TrappedFunctions)
         errs() << "  " << *Function << '\n';
     } else {
-      errs() << " (use -v=1 to see the list).\n";
+      errs() << " Use -v=1 to see the list.\n";
     }
   }
 
@@ -1574,7 +1476,7 @@ PrintProgramStats::runOnFunctions(BinaryContext &BC) {
     outs() << "BOLT-INFO: the input contains "
            << BC.MissedMacroFusionPairs << " (dynamic count : "
            << BC.MissedMacroFusionExecCount
-           << ") missed opportunities for macro-fusion optimization";
+           << ") opportunities for macro-fusion optimization";
     switch (opts::AlignMacroOpFusion) {
     case MFT_NONE:
       outs() << ". Use -align-macro-fusion to fix.\n";

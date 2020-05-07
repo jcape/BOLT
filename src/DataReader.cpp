@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 
+#include "BinaryFunction.h"
 #include "DataReader.h"
 #include "llvm/Support/Debug.h"
 #include <map>
@@ -738,7 +739,20 @@ void DataReader::buildLTONameMaps() {
 namespace {
 template <typename MapTy>
 decltype(MapTy::MapEntryTy::second) *
-fetchMapEntry(MapTy &Map, const std::vector<std::string> &FuncNames) {
+fetchMapEntry(MapTy &Map, const std::vector<MCSymbol *> &Symbols) {
+  // Do a reverse order iteration since the name in profile has a higher chance
+  // of matching a name at the end of the list.
+  for (auto SI = Symbols.rbegin(), SE = Symbols.rend(); SI != SE; ++SI) {
+    auto I = Map.find(normalizeName((*SI)->getName()));
+    if (I != Map.end())
+      return &I->getValue();
+  }
+  return nullptr;
+}
+
+template <typename MapTy>
+decltype(MapTy::MapEntryTy::second) *
+fetchMapEntry(MapTy &Map, const std::vector<StringRef> &FuncNames) {
   // Do a reverse order iteration since the name in profile has a higher chance
   // of matching a name at the end of the list.
   for (auto FI = FuncNames.rbegin(), FE = FuncNames.rend(); FI != FE; ++FI) {
@@ -754,7 +768,7 @@ std::vector<decltype(MapTy::MapEntryTy::second) *>
 fetchMapEntriesRegex(
   MapTy &Map,
   const StringMap<std::vector<decltype(MapTy::MapEntryTy::second) *>> &LTOCommonNameMap,
-  const std::vector<std::string> &FuncNames) {
+  const std::vector<StringRef> &FuncNames) {
   std::vector<decltype(MapTy::MapEntryTy::second) *> AllData;
   // Do a reverse order iteration since the name in profile has a higher chance
   // of matching a name at the end of the list.
@@ -780,28 +794,61 @@ fetchMapEntriesRegex(
 
 }
 
+bool DataReader::mayHaveProfileData(const BinaryFunction &Function) {
+  if (Function.getBranchData() || Function.getMemData())
+    return true;
+
+  if (getFuncBranchData(Function.getNames()) || getFuncMemData(Function.getNames()))
+    return true;
+
+  const auto HasVolatileName = [&Function]() {
+    for (const auto Name : Function.getNames()) {
+      if (getLTOCommonName(Name))
+        return true;
+    }
+    return false;
+  }();
+  if (!HasVolatileName)
+    return false;
+
+  const auto AllBranchData = getFuncBranchDataRegex(Function.getNames());
+  if (!AllBranchData.empty())
+    return true;
+
+  const auto AllMemData = getFuncMemDataRegex(Function.getNames());
+  if (!AllMemData.empty())
+    return true;
+
+  return false;
+}
+
 FuncBranchData *
-DataReader::getFuncBranchData(const std::vector<std::string> &FuncNames) {
+DataReader::getFuncBranchData(const std::vector<StringRef> &FuncNames) {
   return fetchMapEntry<FuncsToBranchesMapTy>(FuncsToBranches, FuncNames);
 }
 
+FuncBranchData *
+DataReader::getFuncBranchData(const std::vector<MCSymbol *> &Symbols) {
+  return fetchMapEntry<FuncsToBranchesMapTy>(FuncsToBranches, Symbols);
+}
+
 FuncMemData *
-DataReader::getFuncMemData(const std::vector<std::string> &FuncNames) {
+DataReader::getFuncMemData(const std::vector<StringRef> &FuncNames) {
   return fetchMapEntry<FuncsToMemEventsMapTy>(FuncsToMemEvents, FuncNames);
 }
 
 FuncSampleData *
-DataReader::getFuncSampleData(const std::vector<std::string> &FuncNames) {
+DataReader::getFuncSampleData(const std::vector<StringRef> &FuncNames) {
   return fetchMapEntry<FuncsToSamplesMapTy>(FuncsToSamples, FuncNames);
 }
 
 std::vector<FuncBranchData *>
-DataReader::getFuncBranchDataRegex(const std::vector<std::string> &FuncNames) {
+DataReader::getFuncBranchDataRegex(const std::vector<StringRef> &FuncNames) {
   return fetchMapEntriesRegex(FuncsToBranches, LTOCommonNameMap, FuncNames);
 }
 
 std::vector<FuncMemData *>
-DataReader::getFuncMemDataRegex(const std::vector<std::string> &FuncNames) {
+DataReader::getFuncMemDataRegex(const std::vector<StringRef> &FuncNames) {
   return fetchMapEntriesRegex(FuncsToMemEvents, LTOCommonNameMemMap, FuncNames);
 }
 

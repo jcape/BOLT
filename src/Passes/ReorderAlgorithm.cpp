@@ -29,6 +29,14 @@ namespace opts {
 extern cl::OptionCategory BoltOptCategory;
 extern cl::opt<bool> NoThreads;
 
+static cl::opt<unsigned> ColdThreshold(
+    "cold-threshold",
+    cl::desc("tenths of percents of main entry frequency to use as a "
+             "threshold when evaluating whether a basic block is cold "
+             "(0 means it is only considered cold if the block has zero "
+             "samples). Default: 0 "),
+    cl::init(0), cl::ZeroOrMore, cl::Hidden, cl::cat(BoltOptCategory));
+
 static cl::opt<bool>
 PrintClusters("print-clusters",
   cl::desc("print clusters"),
@@ -402,7 +410,7 @@ void MinBranchGreedyClusterAlgorithm::reset() {
   Weight.clear();
 }
 
-void OptimalReorderAlgorithm::reorderBasicBlocks(
+void TSPReorderAlgorithm::reorderBasicBlocks(
     const BinaryFunction &BF, BasicBlockOrder &Order) const {
   std::vector<std::vector<uint64_t>> Weight;
   std::vector<BinaryBasicBlock *> IndexToBB;
@@ -629,6 +637,9 @@ void OptimizeCacheReorderAlgorithm::reorderBasicBlocks(
   if (BF.layout_empty())
     return;
 
+  const uint64_t ColdThreshold =
+      opts::ColdThreshold * (*BF.layout_begin())->getExecutionCount() / 1000;
+
   // Cluster basic blocks.
   CAlgo->clusterBasicBlocks(BF);
   std::vector<ClusterAlgorithm::ClusterTy> &Clusters = CAlgo->Clusters;
@@ -668,6 +679,13 @@ void OptimizeCacheReorderAlgorithm::reorderBasicBlocks(
   for (uint32_t ClusterIndex : ClusterOrder) {
     ClusterAlgorithm::ClusterTy &Cluster = Clusters[ClusterIndex];
     Order.insert(Order.end(),  Cluster.begin(), Cluster.end());
+    // Force zero execution count on clusters that do not meet the cut off
+    // specified by --cold-threshold.
+    if (AvgFreq[ClusterIndex] < static_cast<double>(ColdThreshold)) {
+      for (auto BBPtr : Cluster) {
+        BBPtr->setExecutionCount(0);
+      }
+    }
   }
 }
 
@@ -681,7 +699,6 @@ void ReverseReorderAlgorithm::reorderBasicBlocks(
   for (auto RLI = BF.layout_rbegin(); *RLI != FirstBB; ++RLI)
     Order.push_back(*RLI);
 }
-
 
 void RandomClusterReorderAlgorithm::reorderBasicBlocks(
       const BinaryFunction &BF, BasicBlockOrder &Order) const {
