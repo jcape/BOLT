@@ -99,7 +99,7 @@ void LFenceInsertion::runOnFunctions(BinaryContext &BC) {
 
     // For performance reasons, we may want to skip some functions and
     // manually add lfences to them only where absolutely needed.
-    if (!opts::shouldProcess(Function))
+    if (Function.isIgnored())
       continue;
 
     for (auto &BB : Function) {
