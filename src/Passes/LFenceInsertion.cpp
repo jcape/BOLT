@@ -26,7 +26,6 @@
 using namespace llvm;
 using namespace bolt;
 namespace opts {
-extern bool shouldProcess(const bolt::BinaryFunction &Function);
 
 extern cl::OptionCategory BoltCategory;
 
